@@ -97,9 +97,9 @@ notacc = """Bid Not Accepted !
 ❖ Don't send an amount lower than the highest bid
 ❖ Don't send the same amount as the highest bid
 ❖ Follow Minimum Increase Bid Rule:
-+1k if highest is under 50k
-+2k if highest is 50k-100k
-+5k if highest is over 100k"""
++100 if current bid is under 50k
++1k if current bid is 50k-100k
++2k if current bid is over 100k"""
 WELCOME_IMG = None
 try:
     _r = requests.get("https://ik.imagekit.io/cocogoat/1037179104-10000035_hAj39hAZg", timeout=15)
@@ -133,7 +133,7 @@ Auction Trade Group
                ╰➤ @HexaAuctionGc
 
 Use /add to add your items for auction."""
-        welcome_buttons = [[Button.url("Auction Channel", "https://t.me/Shadow_Auction"), Button.url("Trade Grp", "https://t.me/ShadowHeXaGroup")]]
+        welcome_buttons = [[Button.url("Auction Channel", "https://t.me/HexaAuction"), Button.url("Trade Group", "https://t.me/ShadowHeXaGroup")]]
         try:
             if WELCOME_IMG:
                 await event.reply(welcome_text, file=WELCOME_IMG, buttons=welcome_buttons)
@@ -148,7 +148,7 @@ Use /add to add your items for auction."""
         if not current_state:
             return await event.reply("Bid disbaled right now.")
         if event.sender_id not in verified:
-            return await event.reply("Not verified. Please get yourself verifed by admins")
+            return await event.reply("Not verified. Please get yourself verifed by admins in @HexaAuctionGc")
         if event.sender_id in bid_banned:
             return await event.reply("You are banned from bidding")
         hmm = auction_pokes.find_one({"token": _parts[1]})
@@ -169,7 +169,7 @@ Use /add to add your items for auction."""
             response = await conv.get_response(timeout = 90000)
             if validate_base(response):
                 if last_bid < validate_base(response):
-                    if (last_bid <=  50000 and validate_base(response)-last_bid >= 1000) or (last_bid <=  100000 and validate_base(response)-last_bid >= 2000) or (last_bid >  100000 and validate_base(response)-last_bid >= 5000):
+                    if (last_bid <=  50000 and validate_base(response)-last_bid >= 100) or (last_bid <=  100000 and validate_base(response)-last_bid >= 1000) or (last_bid >  100000 and validate_base(response)-last_bid >= 2000):
                         pass
                     else:
                         await conv.send_message(notacc)
