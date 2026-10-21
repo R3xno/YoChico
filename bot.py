@@ -7,7 +7,7 @@ bot_token = "8254395927:AAENpIkOxeoE7eavPZI3Isi65u3KbhGhSwo"
 client = TelegramClient('zaaasuctionbot', api_id, api_hash).start(bot_token=bot_token)
 
 # MongoDB setup
-url = "mongodb+srv://adsbroone_db_user:<njRUYBVrNE0o1a2D>@cluster0.tf0jrql.mongodb.net/"
+url = "mongodb+srv://adsbroone_db_user:njRUYBVrNE0o1a2D@cluster0.tf0jrql.mongodb.net/"
 mongo_client = MongoClient(url)
 db = mongo_client["auction_db"]
 pending_pokes = db["pending_pokes"]
