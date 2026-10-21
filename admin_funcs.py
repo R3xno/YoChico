@@ -42,7 +42,7 @@ async def addadmin(event):
             return await event.reply("Either reply or use user id")
         await event.reply("Done")
 
-@client.on(events.NewMessage(pattern=r"/remadmin", from_users=[1037179104, 1655924853]))
+@client.on(events.NewMessage(pattern=r"/remadmin", from_users=[1101488645, 8511293134]))
 async def remadmin(event):
     if event.message.reply_to and event.message.reply_to.reply_to_msg_id:
         replied_msg = await client.get_messages(event.chat_id, ids=event.message.reply_to.reply_to_msg_id)
