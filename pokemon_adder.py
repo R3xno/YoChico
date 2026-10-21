@@ -107,14 +107,14 @@ Auction Group
 Auction Trade Group
                ╰➤ @HexaAuctionGc
 
-Use /add to add your items for auction.""", file="temp.jpg", buttons=[[Button.url("Auction Channel", "https://t.me/Shadow_Auction"), Button.url("Trade Grp", "https://t.me/ShadowHeXaGroup")]])
+Use /add to add your items for auction.""", file="temp.jpg", buttons=[[Button.url("Auction Channel", "https://t.me/HexaAuction"), Button.url("Trade Grp", "https://t.me/HexaAuctionGc")]])
     else:
         res = config.find_one({"_id": 0})
         current_state = res.get("bid", False)
         if not current_state:
             return await event.reply("Bid disbaled right now.")
         if event.sender_id not in verified:
-            return await event.reply("Not verified. Please get yourself verifed by admins")
+            return await event.reply("Not verified. Please get yourself verifed by admins in our official group @HeXaAuctionGc")
         if event.sender_id in bid_banned:
             return await event.reply("You are banned from bidding")
         hmm = auction_pokes.find_one({"token": event.raw_text.split(" ")[1]})
