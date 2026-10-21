@@ -1,3 +1,7 @@
-python-telegram-bot==21.10
 telethon
 pymongo
+dnspython
+imagekitio<5
+requests
+pillow
+cryptg
