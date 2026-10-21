@@ -100,7 +100,7 @@ notacc = """Bid Not Accepted !
 +1k if highest is under 50k
 +2k if highest is 50k-100k
 +5k if highest is over 100k"""
-img_data = requests.get("https://ik.imagekit.io/cocogoat/1037179104-10000035_hAj39hAZg").content
+img_data = requests.get("http://ibb.co/60J6HcxB").content
 with open("temp.jpg", "wb") as handler:
     handler.write(img_data)
 
