@@ -17,6 +17,16 @@ auction_pokes = db["kekz"]
 previous_data = db["previous_data"]
 user_db = db["user"]
 x = config.find_one({"_id": 0})
+if x is None:
+    config.insert_one({
+        "_id": 0,
+        "admins": [],
+        "sub_banned": [],
+        "bid_banned": [],
+        "verified": [],
+    })
+    x = config.find_one({"_id": 0})
+
 admins = x.get("admins", [])
 sub_banned = x.get("sub_banned", [])
 bid_banned = x.get("bid_banned", [])
