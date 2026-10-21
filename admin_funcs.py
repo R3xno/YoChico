@@ -6,12 +6,12 @@ from bot import client, config, admins, verified, bid_banned, sub_banned, auctio
     bot_username, user_db, previous_data, final_logs_id, rejected_pokes
 import asyncio
 
-@client.on(events.NewMessage(pattern=r"/clear_db", from_users=[1037179104, 1655924853]))
+@client.on(events.NewMessage(pattern=r"/clear_db", from_users=[8511293134, 1101488645]))
 async def addadmin(event):
     auction_pokes.delete_many({})
     await event.reply("Done")
 
-@client.on(events.NewMessage(pattern=r"/addadmin", from_users=[1037179104, 1655924853]))
+@client.on(events.NewMessage(pattern=r"/addadmin", from_users=[8511293134, 1101488645]))
 async def addadmin(event):
     if event.message.reply_to and event.message.reply_to.reply_to_msg_id:
         replied_msg = await client.get_messages(event.chat_id, ids=event.message.reply_to.reply_to_msg_id)
