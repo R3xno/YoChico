@@ -36,8 +36,8 @@ for i in admins:
     verified.append(i)
 auction_channel_id = -1001450650460
 admin_grp_id = -1004367307888
-bid_logs_id = -1004367307888
-final_logs_id = -1004367307888
+bid_logs_id = -1004482113013
+final_logs_id = -1004482113013
 bot_username = "HexaAuctionRobot"
 user_cache = {}
 
