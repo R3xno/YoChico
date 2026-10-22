@@ -19,7 +19,7 @@ from aiohttp import web
 
 from bot import auction_pokes, bot_username
 
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "hexaauction.netlify.app").rstrip("/")
 WEBAPP_HOST = os.environ.get("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT", "8080"))
 AUCTION_CHANNEL = "HexaAuction"  # keep in sync with pokemon_adder.py
