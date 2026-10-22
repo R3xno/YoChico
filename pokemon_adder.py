@@ -139,7 +139,7 @@ notacc = """Bid Not Accepted !
 ❖ Don't send an amount lower than the highest bid
 ❖ Don't send the same amount as the highest bid
 ❖ Follow Minimum Increase Bid Rule:
-+100 if current bid is under 50k
++500 if current bid is under 50k
 +1k if current bid is 50k-100k
 +2k if current bid is over 100k"""
 WELCOME_IMG = None
@@ -211,7 +211,7 @@ Use /add to add your items for auction."""
             response = await conv.get_response(timeout = 90000)
             if validate_base(response):
                 if last_bid < validate_base(response):
-                    if (last_bid <=  50000 and validate_base(response)-last_bid >= 100) or (last_bid <=  100000 and validate_base(response)-last_bid >= 1000) or (last_bid >  100000 and validate_base(response)-last_bid >= 2000):
+                    if (last_bid <=  50000 and validate_base(response)-last_bid >= 500) or (last_bid <=  100000 and validate_base(response)-last_bid >= 1000) or (last_bid >  100000 and validate_base(response)-last_bid >= 2000):
                         pass
                     else:
                         await conv.send_message(notacc)
