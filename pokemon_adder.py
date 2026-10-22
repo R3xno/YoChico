@@ -349,7 +349,7 @@ async def handle_accept(event):
     Highest Bid: {hmm['base']} Pd
     By: No one right now!
 ╰────────────────╯""", buttons=[[Button.inline("Refresh", f"refresh|{ref_id}"), Button.url("Bid", f"t.me/{bot_username}?start={ref_id}")]])
-    auction_pokes.find_one_and_update({"token": ref_id}, {"$set": {"link": f"https://t.me/Shadow_Auction/{m.id}", "bmid":bm.id}})
+    auction_pokes.find_one_and_update({"token": ref_id}, {"$set": {"link": f"https://t.me/HexaAuction/{m.id}", "bmid":bm.id}})
     await event.edit(buttons=Button.clear())
     await event.reply(f"Approved by {await md_mention(event.sender_id)}")
     user_cache.pop(ref_id)
