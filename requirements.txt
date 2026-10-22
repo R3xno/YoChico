@@ -5,3 +5,4 @@ imagekitio<5
 requests
 pillow
 cryptg
+aiohttp
