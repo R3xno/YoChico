@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>HeXa Auction</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --red:#ff3b4e; --blue:#3b82ff; --yellow:#ffd23f; --purple:#a855f7; --green:#34d399;
+  --text:#fff; --muted:rgba(255,255,255,.62);
+  --glass:rgba(255,255,255,.10); --glass-strong:rgba(255,255,255,.16);
+  --stroke:rgba(255,255,255,.22); --shadow:0 10px 40px rgba(0,0,0,.35);
+  --sat:env(safe-area-inset-top,0px); --sab:env(safe-area-inset-bottom,0px);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#0b0f2a;color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Inter","Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;overflow-x:hidden}
+/* animated backdrop */
+.bg{position:fixed;inset:0;z-index:-2;background:
+  radial-gradient(60% 45% at 15% 10%,rgba(255,59,78,.55),transparent 70%),
+  radial-gradient(55% 45% at 90% 20%,rgba(59,130,255,.55),transparent 70%),
+  radial-gradient(60% 50% at 70% 95%,rgba(168,85,247,.45),transparent 70%),
+  radial-gradient(40% 35% at 10% 85%,rgba(255,210,63,.35),transparent 70%),#0b0f2a;
+  animation:drift 18s ease-in-out infinite alternate}
+@keyframes drift{to{filter:hue-rotate(25deg) saturate(1.2);transform:scale(1.06)}}
+.ball-bg{position:fixed;z-index:-1;opacity:.10;pointer-events:none;animation:float 14s ease-in-out infinite}
+.ball-bg.b1{width:260px;top:-60px;right:-80px}
+.ball-bg.b2{width:200px;bottom:90px;left:-70px;animation-delay:-6s}
+@keyframes float{50%{transform:translateY(24px) rotate(25deg)}}
+
+.wrap{max-width:720px;margin:0 auto;padding:calc(var(--sat) + 14px) 16px calc(var(--sab) + 96px)}
+header{display:flex;align-items:center;justify-content:space-between;margin:6px 2px 14px}
+h1{font-size:34px;line-height:1.05;margin:0;font-weight:800;letter-spacing:-.8px}
+h1 small{display:block;font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.6px;text-transform:uppercase;margin-bottom:4px}
+.logo{width:46px;height:46px;flex:none}
+.glass{background:var(--glass);border:1px solid var(--stroke);
+  -webkit-backdrop-filter:blur(28px) saturate(180%);backdrop-filter:blur(28px) saturate(180%);
+  box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.28);border-radius:22px}
+
+/* search + segmented */
+.search{display:flex;align-items:center;gap:8px;padding:11px 14px;margin-bottom:12px;border-radius:16px}
+.search input{flex:1;background:none;border:0;outline:0;color:var(--text);font-size:16px;min-width:0}
+.search input::placeholder{color:var(--muted)}
+.seg{display:flex;gap:4px;padding:4px;border-radius:16px;margin-bottom:12px;overflow-x:auto;scrollbar-width:none}
+.seg::-webkit-scrollbar{display:none}
+.seg button{flex:1 0 auto;border:0;background:transparent;color:var(--muted);font:600 14px inherit;font-family:inherit;
+  padding:9px 14px;border-radius:12px;transition:.25s;white-space:nowrap}
+.seg button.on{background:rgba(255,255,255,.22);color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.4)}
+.sortrow{display:flex;justify-content:space-between;align-items:center;margin:2px 4px 10px;color:var(--muted);font-size:13px;font-weight:600}
+.sortrow select{background:var(--glass);color:#fff;border:1px solid var(--stroke);border-radius:10px;padding:6px 8px;font-size:13px;font-family:inherit;outline:0}
+.sortrow select option{color:#000}
+
+/* cards */
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+@media(min-width:560px){.grid{grid-template-columns:repeat(3,1fr)}}
+.card{position:relative;padding:12px;overflow:hidden;cursor:pointer;transition:transform .2s,background .2s;
+  animation:rise .5s both}
+.card:active{transform:scale(.97)}
+@keyframes rise{from{opacity:0;transform:translateY(14px) scale(.97)}}
+.card::before{content:"";position:absolute;inset:0;background:linear-gradient(135deg,var(--c1,transparent),transparent 55%);opacity:.5;pointer-events:none}
+.card[data-type=legendary]{--c1:rgba(255,210,63,.55)}
+.card[data-type=shiny]{--c1:rgba(168,85,247,.6)}
+.card[data-type=non-legendary]{--c1:rgba(59,130,255,.5)}
+.card[data-type=tm]{--c1:rgba(52,211,153,.5)}
+.sprite{position:relative;height:104px;display:grid;place-items:center}
+.sprite::before{content:"";position:absolute;width:92px;height:92px;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,.28),transparent 70%)}
+.sprite img{position:relative;max-height:96px;max-width:96px;image-rendering:auto;filter:drop-shadow(0 8px 10px rgba(0,0,0,.35));transition:transform .3s}
+.card:hover .sprite img{transform:translateY(-3px) scale(1.05)}
+.tag{position:absolute;top:0;left:0;font-size:10.5px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;
+  padding:4px 8px;border-radius:999px;background:rgba(0,0,0,.35);border:1px solid var(--stroke);z-index:1}
+.tag.legendary{color:var(--yellow)}.tag.shiny{color:#d8b4fe}.tag.non-legendary{color:#93c5fd}.tag.tm{color:var(--green)}
+.nm{font-weight:700;font-size:15.5px;margin:6px 0 1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.price{display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding:8px 10px;border-radius:14px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.12)}
+.price b{font-size:16px;font-variant-numeric:tabular-nums}
+.price span{font-size:11px;color:var(--muted);font-weight:600}
+.coin{display:inline-block;width:11px;height:11px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fff3b0,#ffc400 60%,#c98a00);margin-right:5px;vertical-align:-1px}
+
+/* empty / loading */
+.state{text-align:center;color:var(--muted);padding:60px 20px}
+.state svg{width:84px;margin-bottom:12px;animation:wob 1.6s ease-in-out infinite}
+@keyframes wob{25%{transform:rotate(-14deg)}75%{transform:rotate(14deg)}}
+.skeleton{height:230px;border-radius:22px;background:linear-gradient(100deg,rgba(255,255,255,.06) 30%,rgba(255,255,255,.16) 50%,rgba(255,255,255,.06) 70%);background-size:200% 100%;animation:sh 1.3s infinite}
+@keyframes sh{to{background-position:-200% 0}}
+
+/* tab bar */
+.tabbar{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--sab) + 14px);display:flex;gap:6px;padding:8px;border-radius:26px;z-index:20;width:min(92vw,420px)}
+.tabbar button{flex:1;border:0;background:transparent;color:var(--muted);font:600 11px inherit;font-family:inherit;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px;border-radius:18px;transition:.25s}
+.tabbar button svg{width:22px;height:22px}
+.tabbar button.on{color:#fff;background:rgba(255,255,255,.2);box-shadow:inset 0 1px 0 rgba(255,255,255,.35)}
+
+/* bottom sheet */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:.3s;z-index:30}
+.scrim.on{opacity:1;pointer-events:auto}
+.sheet{position:fixed;left:0;right:0;bottom:0;max-width:720px;margin:0 auto;z-index:40;border-radius:30px 30px 0 0;padding:10px 18px calc(var(--sab) + 18px);
+  transform:translateY(105%);transition:transform .4s cubic-bezier(.2,.9,.25,1);background:rgba(24,28,60,.55);max-height:88vh;overflow:auto}
+.sheet.on{transform:none}
+.grab{width:40px;height:5px;border-radius:3px;background:rgba(255,255,255,.4);margin:2px auto 12px}
+.hero{display:flex;align-items:center;gap:14px}
+.hero .sprite{height:120px;width:120px;flex:none}
+.hero .sprite img{max-height:116px;max-width:116px}
+.hero h2{margin:0;font-size:24px;letter-spacing:-.4px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:12px;font-weight:700;padding:5px 10px;border-radius:999px;background:rgba(255,255,255,.14);border:1px solid var(--stroke)}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0}
+.stat{padding:12px 14px;border-radius:18px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.12)}
+.stat span{display:block;font-size:11.5px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.stat b{font-size:20px;font-variant-numeric:tabular-nums}
+.note{color:var(--muted);font-size:13px;margin:0 2px 14px;line-height:1.4}
+.btns{display:flex;gap:10px}
+.btn{flex:1;border:0;border-radius:18px;padding:15px;font:700 16px inherit;font-family:inherit;color:#fff;cursor:pointer;transition:transform .15s}
+.btn:active{transform:scale(.96)}
+.btn.primary{background:linear-gradient(135deg,#ff3b4e,#ff7a3b);box-shadow:0 8px 24px rgba(255,59,78,.45),inset 0 1px 0 rgba(255,255,255,.4)}
+.btn.ghost{background:rgba(255,255,255,.14);border:1px solid var(--stroke);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<svg class="ball-bg b1" viewBox="0 0 100 100"><use href="#ball"/></svg>
+<svg class="ball-bg b2" viewBox="0 0 100 100"><use href="#ball"/></svg>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="ball" viewBox="0 0 100 100">
+      <circle cx="50" cy="50" r="46" fill="#fff"/>
+      <path d="M4 50a46 46 0 0 1 92 0z" fill="#ff3b4e"/>
+      <rect x="4" y="46" width="92" height="8" fill="#14172f"/>
+      <circle cx="50" cy="50" r="46" fill="none" stroke="#14172f" stroke-width="5"/>
+      <circle cx="50" cy="50" r="14" fill="#fff" stroke="#14172f" stroke-width="5"/>
+      <circle cx="50" cy="50" r="6" fill="#e5e7f0"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <header>
+    <h1><small>Live now</small>HeXa Auction</h1>
+    <svg class="logo"><use href="#ball"/></svg>
+  </header>
+
+  <div class="glass search">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.7)" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="q" type="search" placeholder="Search Pokémon or nature" autocomplete="off">
+  </div>
+
+  <div class="glass seg" id="seg">
+    <button data-f="all" class="on">All</button>
+    <button data-f="legendary">🌟 Legendary</button>
+    <button data-f="non-legendary">🐉 0L</button>
+    <button data-f="shiny">✨ Shiny</button>
+    <button data-f="tm">📚 TMs</button>
+  </div>
+
+  <div class="sortrow">
+    <span id="count">&nbsp;</span>
+    <select id="sort">
+      <option value="new">Newest</option>
+      <option value="hi">Price: high</option>
+      <option value="lo">Price: low</option>
+      <option value="bids">Most bids</option>
+    </select>
+  </div>
+
+  <div id="grid" class="grid"></div>
+  <div id="state" class="state hidden"></div>
+</div>
+
+<nav class="glass tabbar">
+  <button class="on" id="tabAuction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h6m6 0h6"/><circle cx="12" cy="12" r="3"/></svg>Auction</button>
+  <button id="tabRefresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button>
+  <button id="tabChannel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 3-9 18-3-8-8-3z"/></svg>Channel</button>
+</nav>
+
+<div class="scrim" id="scrim"></div>
+<div class="sheet glass" id="sheet"></div>
+
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg){ tg.ready(); tg.expand(); try{tg.setHeaderColor('#0b0f2a');tg.setBackgroundColor('#0b0f2a');}catch(e){} }
+const hap = (t='light')=>{ try{ tg.HapticFeedback.impactOccurred(t);}catch(e){} };
+
+let items=[], filter='all', term='', sort='new';
+const $ = s=>document.querySelector(s);
+const esc = s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n=>Number(n||0).toLocaleString('en-US');
+const LABEL = {legendary:'Legendary','non-legendary':'0L',shiny:'Shiny',tm:'TM'};
+const BALL = '<svg viewBox="0 0 100 100" width="100%" height="100%"><use href="#ball"/></svg>';
+
+function spriteUrl(it){
+  if(it.type==='tm') return null;
+  const kind = it.type==='shiny' ? 'shiny' : 'normal';
+  return `https://img.pokemondb.net/sprites/home/${kind}/${encodeURIComponent(it.slug)}.png`;
+}
+function spriteHtml(it){
+  const u = spriteUrl(it);
+  if(!u) return `<div style="width:70px;height:70px">${BALL}</div>`;
+  return `<img loading="lazy" src="${u}" alt="" onerror="this.outerHTML='<div style=&quot;width:70px;height:70px&quot;>${BALL.replace(/"/g,'&quot;')}</div>'">`;
+}
+
+function visible(){
+  let l = items.filter(i=>(filter==='all'||i.type===filter) &&
+    (!term || (i.name+' '+i.nature).toLowerCase().includes(term)));
+  if(sort==='hi') l.sort((a,b)=>b.current-a.current);
+  else if(sort==='lo') l.sort((a,b)=>a.current-b.current);
+  else if(sort==='bids') l.sort((a,b)=>b.bids-a.bids);
+  else l.reverse(); // newest first (db insertion order)
+  return l;
+}
+
+function render(){
+  const l = visible(), g=$('#grid'), st=$('#state');
+  $('#count').textContent = `${l.length} item${l.length===1?'':'s'}`;
+  if(!l.length){
+    g.innerHTML=''; st.classList.remove('hidden');
+    st.innerHTML = `<svg viewBox="0 0 100 100"><use href="#ball"/></svg><div style="font-weight:700;font-size:17px;color:#fff">No Pokémon found</div><div>Try another filter or check back soon.</div>`;
+    return;
+  }
+  st.classList.add('hidden');
+  g.innerHTML = l.map((it,i)=>`
+    <div class="card glass" data-type="${it.type}" data-t="${esc(it.token)}" style="animation-delay:${Math.min(i,12)*40}ms">
+      <div class="sprite"><span class="tag ${it.type}">${LABEL[it.type]||''}</span>${spriteHtml(it)}</div>
+      <div class="nm">${esc(it.name)}</div>
+      <div class="sub">${esc(it.type==='tm' ? (it.nature||'') : (it.nature||'—') + (it.level?` • Lv ${esc(it.level)}`:''))}</div>
+      <div class="price"><div><span>${it.bids?'Highest bid':'Base'}</span><br><b><i class="coin"></i>${fmt(it.current)}</b></div><span>${it.bids} bid${it.bids===1?'':'s'}</span></div>
+    </div>`).join('');
+}
+
+function skeleton(){
+  $('#state').classList.add('hidden');
+  $('#grid').innerHTML = '<div class="skeleton"></div>'.repeat(6);
+}
+
+async function load(){
+  skeleton();
+  try{
+    const r = await fetch('/api/items?_='+Date.now(), {cache:'no-store'});
+    items = (await r.json()).items || [];
+    render();
+  }catch(e){
+    $('#grid').innerHTML='';
+    const st=$('#state'); st.classList.remove('hidden');
+    st.innerHTML=`<svg viewBox="0 0 100 100"><use href="#ball"/></svg><div style="font-weight:700;font-size:17px;color:#fff">Couldn't load auctions</div><div>Pull the Refresh tab to try again.</div>`;
+  }
+}
+
+/* detail sheet */
+function openSheet(token){
+  const it = items.find(i=>i.token===token); if(!it) return;
+  hap();
+  $('#sheet').innerHTML = `
+    <div class="grab"></div>
+    <div class="hero">
+      <div class="sprite">${spriteHtml(it)}</div>
+      <div><h2>${esc(it.name)}</h2>
+        <div class="chips">
+          <span class="chip">${LABEL[it.type]||''}</span>
+          ${it.nature && it.type!=='tm' ? `<span class="chip">🌿 ${esc(it.nature)}</span>`:''}
+          ${it.level ? `<span class="chip">Lv ${esc(it.level)}</span>`:''}
+        </div></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><span>${it.bids?'Highest bid':'Base price'}</span><b><i class="coin"></i>${fmt(it.current)}</b></div>
+      <div class="stat"><span>Next min bid</span><b>${fmt(it.next_min)}</b></div>
+      <div class="stat"><span>Total bids</span><b>${it.bids}</b></div>
+      <div class="stat"><span>Base</span><b>${fmt(it.base)}</b></div>
+    </div>
+    ${it.type==='tm' && it.info ? `<p class="note">${esc(it.nature)}<br>${esc(it.info)}</p>`:''}
+    ${it.boosted && it.type!=='tm' ? `<p class="note">⚡ Boosted: ${esc(it.boosted)}</p>`:''}
+    <div class="btns">
+      ${it.post?`<button class="btn ghost" id="bPost">View post</button>`:''}
+      <button class="btn primary" id="bBid">Place bid</button>
+    </div>`;
+  $('#sheet').classList.add('on'); $('#scrim').classList.add('on');
+  $('#bBid').onclick=()=>{hap('medium'); openTg(it.bid_url);};
+  const bp=$('#bPost'); if(bp) bp.onclick=()=>openTg(it.post);
+}
+function closeSheet(){ $('#sheet').classList.remove('on'); $('#scrim').classList.remove('on'); }
+function openTg(url){
+  if(tg && tg.openTelegramLink){ tg.openTelegramLink(url); setTimeout(()=>{ try{tg.close();}catch(e){} },300); }
+  else window.open(url,'_blank');
+}
+
+/* events */
+$('#grid').addEventListener('click',e=>{ const c=e.target.closest('.card'); if(c) openSheet(c.dataset.t); });
+$('#scrim').onclick=closeSheet;
+$('#seg').addEventListener('click',e=>{
+  const b=e.target.closest('button'); if(!b) return; hap('light');
+  document.querySelectorAll('#seg button').forEach(x=>x.classList.toggle('on',x===b));
+  filter=b.dataset.f; render();
+});
+$('#q').addEventListener('input',e=>{ term=e.target.value.trim().toLowerCase(); render(); });
+$('#sort').addEventListener('change',e=>{ sort=e.target.value; render(); });
+$('#tabAuction').onclick=()=>{ hap(); window.scrollTo({top:0,behavior:'smooth'}); };
+$('#tabRefresh').onclick=()=>{ hap('medium'); load(); };
+$('#tabChannel').onclick=()=>{ hap(); openTg('https://t.me/HexaAuction'); };
+if(tg){ tg.BackButton && tg.BackButton.onClick(closeSheet); }
+
+load();
+setInterval(()=>{ if(!document.hidden && !$('#sheet').classList.contains('on')) fetch('/api/items?_='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(d=>{items=d.items||[];render();}).catch(()=>{}); }, 30000);
+</script>
+</body>
+</html>
