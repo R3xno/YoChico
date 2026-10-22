@@ -3,7 +3,7 @@ from pymongo import MongoClient
 
 api_id = 3344739
 api_hash = '88d43ee045dd90660b4360ba59fe3c48'
-bot_token = "8254395927:AAGG9tRX6-NjWjfu3Ny1Jv1BMsDyjbKhqzI"
+bot_token = "8254395927:AAE2G6zMMQ-7keKBNV1nNxpShKcpY0jejXw"
 client = TelegramClient('zaaasuctionbot', api_id, api_hash).start(bot_token=bot_token)
 
 # MongoDB setup
