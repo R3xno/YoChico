@@ -1,15 +1,27 @@
 """
-Glass-style profile card for the /profile command.
+Fast glass-style profile card (Gengar purple theme) for the /profile command.
 
 Needs:  pip install pillow requests
-Usage:  png = render_profile(name, username, status, approved, sold, points, avatar_bytes)
-        -> io.BytesIO (PNG)   |   status: "verified" | "unverified" | "admin"
+Usage:  buf = render_profile(name, username, status, approved, sold, points, avatar_bytes)
+        -> io.BytesIO (JPEG)   |   status: "verified" | "unverified" | "admin"
         approved / sold = [legendary, non-legendary, shiny, tms]
+
+Why it is fast
+--------------
+Everything that never changes (background, blurred glass panels, shadows, star, labels) is rendered
+ONCE in a background thread at startup and kept in memory. A /profile request only copies that image
+and draws the name, avatar and numbers on it (a few milliseconds). Finished cards are also kept in a
+small cache, so the same profile asked twice costs nothing.
 """
 import io
+import math
 import os
+import threading
 import time
 import unicodedata
+import zlib
+from collections import OrderedDict
+from functools import lru_cache
 
 import requests
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -17,69 +29,88 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BG_URL = "https://envs.sh/0ul.jpg"        # same picture the old /profile used as background
-BG_CACHE = "profile_bg.jpg"
-FONT_DIR = "fonts"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
+BG_CACHE = os.path.join(BASE_DIR, "profile_bg.jpg")
+BG_URL = "https://envs.sh/0ul.jpg"     # the picture the old /profile used as background
+BG_TINT = 0.62                          # 0 = your picture only, 1 = pure purple gradient
 
-W, H = 1500, 640
-MARGIN = 70
-ACCENT = (110, 232, 255)                   # cyan highlight (Auction Points)
+W, H = 1280, 560
+M = 56                                  # outer margin
+
+# Gengar palette
+C_DARK = (22, 9, 44)                    # deep indigo
+C_MID = (84, 44, 148)                   # body purple
+C_LIGHT = (142, 82, 206)                # light violet
+VEIL = (236, 220, 255)                  # glass tint
+SHADOW = (8, 2, 20)
+WHITE = (255, 255, 255)
+MUTED = (218, 200, 245)                 # labels
+NUM_COLOR = (238, 205, 255)             # Auction Points number
+NUM_GLOW = (178, 96, 255)
+STAR_COLOR = (255, 112, 168)            # Gengar's eyes
 STATUS_STYLE = {
-    "verified": ("VERIFIED", (96, 228, 150)),
-    "unverified": ("UNVERIFIED", (255, 125, 125)),
-    "admin": ("ADMIN", (255, 206, 96)),
+    "verified": ("VERIFIED", (110, 236, 162)),
+    "unverified": ("UNVERIFIED", (255, 112, 132)),
+    "admin": ("ADMIN", (255, 208, 110)),
 }
 
+# Layout
+AV = 190                                # avatar size
+AX, AY = M, M
+PC = (724, M, W - M, M + AV)            # Auction Points card
+SP = (M, 282, W - M, 504)               # stats panel
+LABEL_W = 230                           # row-label column inside the stats panel
+HEAD_H = 66                             # header height inside the stats panel
+
+
 # ---------------------------------------------------------------------------
-# Fonts (Poppins). Uses a local copy / system copy, tries to download once,
-# and finally falls back to DejaVu / Pillow's default so it never crashes.
+# Fonts - loaded from ./fonts (shipped with the bot). Never downloaded while a request is waiting.
 # ---------------------------------------------------------------------------
-_WEIGHTS = {"light": "Light", "regular": "Regular", "medium": "Medium", "bold": "Bold"}
-_font_cache = {}
-_font_download_tried = False
+_FONT_FILES = {"light": "Poppins-Light.ttf", "medium": "Poppins-Medium.ttf", "bold": "Poppins-Bold.ttf"}
 _SYSTEM_DIRS = ["/usr/share/fonts/truetype/google-fonts", "/usr/share/fonts/truetype/poppins",
                 "/usr/share/fonts/poppins", os.path.expanduser("~/.fonts")]
+_font_cache = {}
+_fonts_checked = False
 
 
-def _download_fonts():
-    global _font_download_tried
-    if _font_download_tried:
+def _ensure_fonts():
+    """If the fonts folder is missing, try ONCE (short timeouts) to fetch Poppins; else fall back to DejaVu."""
+    global _fonts_checked
+    if _fonts_checked:
         return
-    _font_download_tried = True
-    os.makedirs(FONT_DIR, exist_ok=True)
-    for w in _WEIGHTS.values():
-        path = os.path.join(FONT_DIR, f"Poppins-{w}.ttf")
-        if os.path.exists(path):
+    _fonts_checked = True
+    for fname in _FONT_FILES.values():
+        if os.path.exists(os.path.join(FONT_DIR, fname)) or any(
+                os.path.exists(os.path.join(d, fname)) for d in _SYSTEM_DIRS):
             continue
         try:
-            r = requests.get(f"https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-{w}.ttf",
-                             timeout=20)
+            os.makedirs(FONT_DIR, exist_ok=True)
+            r = requests.get(f"https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/{fname}", timeout=6)
             if r.status_code == 200 and len(r.content) > 10000:
-                with open(path, "wb") as f:
+                with open(os.path.join(FONT_DIR, fname), "wb") as f:
                     f.write(r.content)
         except Exception as e:
-            print("font download failed:", e)
-            return
+            print("profile font download skipped:", e)
+            return            # offline -> stop trying, fallback fonts are used
 
 
-def font(size, weight="regular"):
+def font(size, weight="medium"):
     key = (size, weight)
-    if key in _font_cache:
-        return _font_cache[key]
-    fname = f"Poppins-{_WEIGHTS[weight]}.ttf"
+    f = _font_cache.get(key)
+    if f is not None:
+        return f
+    fname = _FONT_FILES[weight]
     paths = [os.path.join(FONT_DIR, fname)] + [os.path.join(d, fname) for d in _SYSTEM_DIRS]
-    if not any(os.path.exists(p) for p in paths):
-        _download_fonts()
     paths.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if weight == "bold"
                  else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-    paths += ["arialbd.ttf" if weight == "bold" else "arial.ttf"]
-    f = None
+    paths.append("arialbd.ttf" if weight == "bold" else "arial.ttf")
     for p in paths:
         try:
             f = ImageFont.truetype(p, size)
             break
         except Exception:
-            continue
+            f = None
     if f is None:
         try:
             f = ImageFont.load_default(size)
@@ -89,149 +120,74 @@ def font(size, weight="regular"):
     return f
 
 
-# ---------------------------------------------------------------------------
-# Background
-# ---------------------------------------------------------------------------
-_bg_cache = None
-_bg_last_try = 0
+_measure = ImageDraw.Draw(Image.new("L", (1, 1)))
 
 
-def _gradient_bg():
-    """Fallback teal gradient (used only if the background picture can't be loaded)."""
-    base = Image.new("RGB", (W, H))
-    px = base.load()
-    c0, c1 = (0, 176, 206), (0, 88, 124)
-    for x in range(W):
-        for y in range(H):
-            t = min(1.0, max(0.0, (x / W) * 0.75 + (y / H) * 0.25))
-            px[x, y] = tuple(int(c0[i] + (c1[i] - c0[i]) * t) for i in range(3))
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(glow)
-    d.ellipse((900, -250, 1700, 450), fill=(255, 255, 255, 38))
-    d.ellipse((-250, 300, 450, 900), fill=(255, 255, 255, 26))
-    glow = glow.filter(ImageFilter.GaussianBlur(90))
-    return Image.alpha_composite(base.convert("RGBA"), glow)
-
-
-def _cover(img, w, h):
-    iw, ih = img.size
-    scale = max(w / iw, h / ih)
-    img = img.resize((int(iw * scale) + 1, int(ih * scale) + 1), Image.LANCZOS)
-    x, y = (img.width - w) // 2, (img.height - h) // 2
-    return img.crop((x, y, x + w, y + h))
-
-
-def get_background():
-    global _bg_cache, _bg_last_try
-    if _bg_cache is not None:
-        return _bg_cache.copy()
-    img = None
-    try:
-        if os.path.exists(BG_CACHE):
-            img = Image.open(BG_CACHE)
-            img.load()
-        elif time.time() - _bg_last_try > 300:
-            _bg_last_try = time.time()
-            r = requests.get(BG_URL, timeout=15)
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
-                with open(BG_CACHE, "wb") as f:
-                    f.write(r.content)
-                img = Image.open(io.BytesIO(r.content))
-                img.load()
-    except Exception as e:
-        print("profile background load failed:", e)
-        img = None
-    if img is None:
-        return _gradient_bg()          # not cached -> retried later
-    bg = _cover(img.convert("RGB"), W, H).convert("RGBA")
-    # soft dark veil so the white text stays readable on any picture
-    bg = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 20, 40, 85)))
-    _bg_cache = bg
-    return bg.copy()
+def text_w(s, f):
+    return _measure.textlength(s, font=f)
 
 
 # ---------------------------------------------------------------------------
-# Drawing helpers
+# Small drawing helpers (all work in place on RGB images, local regions only)
 # ---------------------------------------------------------------------------
-S = 4  # supersampling for smooth rounded corners
+S = 3   # supersampling for smooth rounded corners
 
 
-def _rr_mask(w, h, radius):
+@lru_cache(maxsize=24)
+def rr_mask(w, h, r):
     m = Image.new("L", (w * S, h * S), 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=radius * S, fill=255)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=r * S, fill=255)
     return m.resize((w, h), Image.LANCZOS)
 
 
-def glass(img, box, radius=34, alpha_top=62, alpha_bottom=26, blur=16, tint=None):
-    """Frosted-glass panel: blurred backdrop + white veil + thin light border + soft shadow."""
+def _shadow(img, box, radius, offset=12, blur=18, opacity=0.42):
+    x0, y0, x1, y1 = box
+    w, h, p = x1 - x0, y1 - y0, blur * 2
+    m = Image.new("L", (w + 2 * p, h + 2 * p), 0)
+    m.paste(rr_mask(w, h, radius), (p, p))
+    m = m.filter(ImageFilter.GaussianBlur(blur)).point(lambda v: int(v * opacity))
+    img.paste(SHADOW, (x0 - p, y0 - p + offset), m)
+
+
+def glass(img, box, radius=36, a_top=72, a_bot=36, blur=14, shadow=True):
+    """Frosted glass: shadow + blurred backdrop + violet veil + thin light border."""
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
-    mask = _rr_mask(w, h, radius)
-
-    # shadow
-    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sh.paste((0, 25, 45, 70), (x0, y0 + 12), mask)
-    img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(20)))
-
-    # frosted backdrop
-    backdrop = img.crop(box).filter(ImageFilter.GaussianBlur(blur))
-    img.paste(backdrop, (x0, y0), mask)
-
-    # white veil (vertical gradient)
-    grad = Image.linear_gradient("L").resize((w, h))           # black -> white, top -> bottom
-    grad = grad.point(lambda v: int(alpha_top + (alpha_bottom - alpha_top) * v / 255))
-    veil_alpha = ImageChops.multiply(grad, mask)
-    veil = Image.new("RGBA", (w, h), tint or (255, 255, 255, 0))
-    veil.putalpha(veil_alpha)
-    img.alpha_composite(veil, (x0, y0))
-
-    # border
+    if shadow:
+        _shadow(img, box, radius)
+    mask = rr_mask(w, h, radius)
+    img.paste(img.crop(box).filter(ImageFilter.GaussianBlur(blur)), (x0, y0), mask)
+    grad = Image.linear_gradient("L").resize((w, h), Image.BILINEAR)
+    grad = grad.point(lambda v: a_top + (a_bot - a_top) * v // 255)
+    img.paste(VEIL, (x0, y0), ImageChops.multiply(grad, mask))
     inner = Image.new("L", (w, h), 0)
-    inner.paste(_rr_mask(w - 4, h - 4, max(radius - 2, 1)), (2, 2))
-    border = ImageChops.subtract(mask, inner).point(lambda v: int(v * 0.55))
-    b = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-    b.putalpha(border)
-    img.alpha_composite(b, (x0, y0))
+    inner.paste(rr_mask(w - 4, h - 4, max(radius - 2, 1)), (2, 2))
+    img.paste(WHITE, (x0, y0), ImageChops.subtract(mask, inner).point(lambda v: int(v * 0.6)))
 
 
-def text(img, xy, s, fnt, fill=(255, 255, 255, 255), anchor="la"):
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text(xy, s, font=fnt, fill=fill, anchor=anchor)
-    img.alpha_composite(layer)
-
-
-def glow_text(img, xy, s, fnt, color, anchor="la", radius=22, strength=150):
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text(xy, s, font=fnt, fill=color + (strength,), anchor=anchor)
-    img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(radius)))
-    text(img, xy, s, fnt, color + (255,), anchor)
-
-
-def spaced_text(img, xy, s, fnt, fill, spacing=3, anchor="l"):
-    """Letter-spaced caps. anchor: 'l' left, 'm' centre, 'r' right (x = reference, y = middle)."""
-    d = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    widths = [d.textlength(c, font=fnt) for c in s]
+def spaced(d, x, y, s, f, fill, spacing=2, anchor="l"):
+    """Letter-spaced caps drawn straight on the image. y = vertical middle."""
+    widths = [text_w(c, f) for c in s]
     total = sum(widths) + spacing * (len(s) - 1)
-    x, y = xy
     if anchor == "m":
         x -= total / 2
     elif anchor == "r":
         x -= total
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    for c, wd in zip(s, widths):
-        ld.text((x, y), c, font=fnt, fill=fill, anchor="lm")
-        x += wd + spacing
-    img.alpha_composite(layer)
+    for c, w in zip(s, widths):
+        d.text((x, y), c, font=f, fill=fill, anchor="lm")
+        x += w + spacing
     return total
 
 
-def star(cx, cy, r_out, r_in, points=5, rot=-90):
-    import math
+def spaced_width(s, f, spacing=2):
+    return sum(text_w(c, f) for c in s) + spacing * (len(s) - 1)
+
+
+def star_points(cx, cy, r_out, r_in, n=5, rot=-90):
     pts = []
-    for i in range(points * 2):
+    for i in range(n * 2):
         r = r_out if i % 2 == 0 else r_in
-        a = math.radians(rot + i * 180 / points)
+        a = math.radians(rot + i * 180 / n)
         pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
     return pts
 
@@ -240,8 +196,7 @@ def clean_name(s, fallback="User"):
     """Keep only characters the Latin font can draw (emoji / other scripts would show as boxes)."""
     out = []
     for ch in str(s or ""):
-        cat = unicodedata.category(ch)
-        if cat[0] in "CZ" and ch != " ":
+        if unicodedata.category(ch)[0] in "CZ" and ch != " ":
             continue
         if ord(ch) > 0x24F and not (0x2010 <= ord(ch) <= 0x2027):
             continue
@@ -251,138 +206,293 @@ def clean_name(s, fallback="User"):
 
 
 def fit_text(s, max_w, start, min_size, weight):
-    d = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     size = start
-    while size > min_size and d.textlength(s, font=font(size, weight)) > max_w:
+    while size > min_size and text_w(s, font(size, weight)) > max_w:
         size -= 2
     f = font(size, weight)
-    if d.textlength(s, font=f) > max_w:
-        while len(s) > 1 and d.textlength(s + "…", font=f) > max_w:
+    if text_w(s, f) > max_w:
+        while len(s) > 1 and text_w(s + "…", f) > max_w:
             s = s[:-1]
         s = s.rstrip() + "…"
     return s, f
 
 
 # ---------------------------------------------------------------------------
-# Avatar
+# Background (purple gradient, optionally mixed with the old /profile picture)
 # ---------------------------------------------------------------------------
-def _avatar(avatar_bytes, size, initial):
-    img = None
+def _cover(img, w, h):
+    iw, ih = img.size
+    scale = max(w / iw, h / ih)
+    img = img.resize((max(w, round(iw * scale)), max(h, round(ih * scale))), Image.LANCZOS)
+    x, y = (img.width - w) // 2, (img.height - h) // 2
+    return img.crop((x, y, x + w, y + h))
+
+
+def _load_picture():
+    """Background picture (RGB, W x H) or None. Downloaded once, then read from disk."""
+    try:
+        if not os.path.exists(BG_CACHE):
+            r = requests.get(BG_URL, timeout=8)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/") \
+                    and len(r.content) < 15_000_000:
+                with open(BG_CACHE, "wb") as f:
+                    f.write(r.content)
+            else:
+                return None
+        img = Image.open(BG_CACHE)
+        img.draft("RGB", (W * 2, H * 2))      # JPEG: decode at reduced size -> fast + low RAM
+        img = _cover(img.convert("RGB"), W, H)
+        return img
+    except Exception as e:
+        print("profile background unavailable:", e)
+        return None
+
+
+def _gradient():
+    v = Image.linear_gradient("L").resize((W, H), Image.BILINEAR)
+    hz = Image.linear_gradient("L").rotate(90).resize((W, H), Image.BILINEAR)
+    t = Image.blend(hz, v, 0.38)                                     # diagonal 0..255
+    a = Image.composite(Image.new("RGB", (W, H), C_MID), Image.new("RGB", (W, H), C_DARK),
+                        t.point(lambda x: min(255, x * 2)))
+    img = Image.composite(Image.new("RGB", (W, H), C_LIGHT), a, t.point(lambda x: max(0, (x - 128) * 2)))
+    # soft glows, drawn small then scaled up (cheap)
+    sw, sh = W // 4, H // 4
+    for color, ellipse, strength in (((190, 120, 255), (sw * 0.55, -sh * 0.5, sw * 1.25, sh * 0.9), 0.55),
+                                     ((255, 90, 170), (-sw * 0.3, sh * 0.5, sw * 0.4, sh * 1.5), 0.30)):
+        g = Image.new("L", (sw, sh), 0)
+        ImageDraw.Draw(g).ellipse(ellipse, fill=255)
+        g = g.filter(ImageFilter.GaussianBlur(16)).resize((W, H), Image.BICUBIC)
+        img.paste(color, (0, 0), g.point(lambda x, s=strength: int(x * s)))
+    return img
+
+
+def _background(pic):
+    grad = _gradient()
+    img = Image.blend(pic, grad, BG_TINT) if pic is not None else grad
+    return Image.blend(img, Image.new("RGB", (W, H), C_DARK), 0.22)   # slight darkening for contrast
+
+
+# ---------------------------------------------------------------------------
+# Static layer: built once, kept in memory
+# ---------------------------------------------------------------------------
+_state = None
+_state_lock = threading.Lock()
+_retrying = False
+CATS = ["LEGENDARY", "NON-LEGENDARY", "SHINY", "TMS"]
+NAME_X = AX + AV + 34
+NUM_X = PC[0] + 172
+NUM_Y = (PC[1] + PC[3]) // 2 + 24
+COL_W = (SP[2] - SP[0] - LABEL_W - 20) / 4
+ROW_Y = [SP[1] + HEAD_H + 44, SP[1] + HEAD_H + 44 + 78]
+
+
+def col_x(i):
+    return SP[0] + LABEL_W + COL_W * i + COL_W / 2
+
+
+def _build_state():
+    _ensure_fonts()
+    pic = _load_picture()
+    img = _background(pic)
+
+    # --- avatar ring + shadow
+    rw = AV + 12
+    ring = rr_mask(rw, rw, 52)
+    sh = Image.new("L", (rw + 48, rw + 48), 0)
+    sh.paste(ring, (24, 24))
+    img.paste(SHADOW, (AX - 6 - 24, AY - 6 - 24 + 12),
+              sh.filter(ImageFilter.GaussianBlur(14)).point(lambda v: int(v * 0.5)))
+    img.paste(WHITE, (AX - 6, AY - 6), ring)
+
+    # --- Auction Points card (the highlight)
+    glass(img, PC, radius=40, a_top=82, a_bot=42, blur=18)
+    cw, ch = PC[2] - PC[0], PC[3] - PC[1]
+    wash = Image.new("L", (cw // 4, ch // 4), 0)
+    ImageDraw.Draw(wash).ellipse((-30, -12, cw // 4 * 0.55, ch // 4 + 12), fill=255)
+    wash = wash.filter(ImageFilter.GaussianBlur(10)).resize((cw, ch), Image.BICUBIC)
+    img.paste(NUM_GLOW, (PC[0], PC[1]),
+              ImageChops.multiply(wash, rr_mask(cw, ch, 40)).point(lambda v: int(v * 0.5)))
+    sx, sy, box = PC[0] + 92, (PC[1] + PC[3]) // 2, 150
+    big = Image.new("L", (box * 4, box * 4), 0)
+    ImageDraw.Draw(big).polygon(star_points(box * 2, box * 2 + 8, 46 * 4, 19 * 4), fill=255)
+    sm = big.resize((box, box), Image.LANCZOS)
+    img.paste(STAR_COLOR, (sx - box // 2, sy - box // 2),
+              sm.filter(ImageFilter.GaussianBlur(14)).point(lambda v: int(v * 0.85)))
+    img.paste(STAR_COLOR, (sx - box // 2, sy - box // 2), sm)
+
+    # --- stats panel
+    glass(img, SP, radius=40)
+
+    # --- static text
+    d = ImageDraw.Draw(img)
+    spaced(d, NUM_X + 4, PC[1] + 50, "AUCTION POINTS", font(22, "medium"), MUTED, spacing=5)
+    d.line((SP[0] + 34, SP[1] + HEAD_H, SP[2] - 34, SP[1] + HEAD_H), fill=(176, 150, 214), width=2)
+    head_size = 22
+    while head_size > 15 and spaced_width("NON-LEGENDARY", font(head_size, "medium"), 1) > COL_W - 14:
+        head_size -= 1
+    hf = font(head_size, "medium")
+    for i, c in enumerate(CATS):
+        spaced(d, col_x(i), SP[1] + HEAD_H // 2 + 2, c, hf, MUTED, spacing=1, anchor="m")
+    for label, y in zip(("APPROVED", "SOLD"), ROW_Y):
+        spaced(d, SP[0] + 38, y, label, font(23, "medium"), MUTED, spacing=3)
+
+    return {"base": img, "has_pic": pic is not None, "built": time.time(), "pills": {},
+            "av_mask": rr_mask(AV, AV, 46)}
+
+
+def _get_state():
+    global _state
+    st = _state
+    if st is not None:
+        if not st["has_pic"] and time.time() - st["built"] > 600:
+            _retry_picture()
+        return st
+    with _state_lock:
+        if _state is None:
+            _state = _build_state()
+        return _state
+
+
+def _retry_picture():
+    """The background picture failed earlier: retry in the background, never block a request."""
+    global _retrying
+    if _retrying:
+        return
+    _retrying = True
+
+    def work():
+        global _state, _retrying
+        try:
+            new = _build_state()
+            if new["has_pic"]:
+                _state = new
+            else:
+                _state["built"] = time.time()
+        except Exception as e:
+            print("profile background retry failed:", e)
+        finally:
+            _retrying = False
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def warmup():
+    try:
+        _get_state()
+    except Exception as e:
+        print("profile card warmup failed:", e)
+
+
+threading.Thread(target=warmup, daemon=True).start()     # build the static layer in the background at startup
+
+
+# ---------------------------------------------------------------------------
+# Per-request pieces
+# ---------------------------------------------------------------------------
+def _pill(st, status):
+    p = st["pills"].get(status)
+    if p is not None:
+        return p
+    label, color = STATUS_STYLE.get(status, STATUS_STYLE["unverified"])
+    f = font(20, "medium")
+    pw, ph = int(spaced_width(label, f, 3)) + 78, 44
+    px, py = NAME_X, AY + 4
+    patch = st["base"].crop((px, py, px + pw, py + ph))
+    glass(patch, (0, 0, pw, ph), radius=22, a_top=84, a_bot=52, blur=8, shadow=False)
+    dm = Image.new("L", (72, 72), 0)
+    ImageDraw.Draw(dm).ellipse((0, 0, 71, 71), fill=255)
+    dm = dm.resize((18, 18), Image.LANCZOS)
+    patch.paste(color, (22, ph // 2 - 9), dm)
+    spaced(ImageDraw.Draw(patch), 54, ph // 2, label, f, WHITE, spacing=3)
+    p = (patch, (px, py))
+    st["pills"][status] = p
+    return p
+
+
+def _avatar(avatar_bytes, initial):
     if avatar_bytes:
         try:
-            img = Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
-            img = _cover(img, size, size)
+            img = Image.open(io.BytesIO(avatar_bytes))
+            img.draft("RGB", (AV * 2, AV * 2))
+            return _cover(img.convert("RGB"), AV, AV)
         except Exception:
-            img = None
-    if img is None:
-        img = Image.new("RGB", (size, size))
-        g = Image.linear_gradient("L").resize((size, size))
-        top, bottom = Image.new("RGB", (size, size), (70, 200, 230)), Image.new("RGB", (size, size), (20, 110, 150))
-        img = Image.composite(bottom, top, g)
-        d = ImageDraw.Draw(img)
-        d.text((size / 2, size / 2), (initial or "U")[0].upper(), font=font(int(size * 0.5), "bold"),
-               fill=(255, 255, 255), anchor="mm")
-    return img.convert("RGBA")
+            pass
+    g = Image.linear_gradient("L").resize((AV, AV), Image.BILINEAR)
+    img = Image.composite(Image.new("RGB", (AV, AV), (60, 28, 110)), Image.new("RGB", (AV, AV), (150, 90, 215)), g)
+    ImageDraw.Draw(img).text((AV / 2, AV / 2), (initial or "U")[0].upper(), font=font(96, "bold"),
+                             fill=WHITE, anchor="mm")
+    return img
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def render_profile(name, username, status, approved, sold, points, avatar_bytes=None):
-    img = get_background()
-    label, scolor = STATUS_STYLE.get(status, STATUS_STYLE["unverified"])
-    name = clean_name(name, fallback=clean_name(username, "User") if username else "User")
-
-    # ---- left: avatar -------------------------------------------------------
-    av = 230
-    ax, ay = MARGIN, MARGIN
-    ring = Image.new("RGBA", (av + 12, av + 12), (0, 0, 0, 0))
-    ring_mask = _rr_mask(av + 12, av + 12, 52)
-    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sh.paste((0, 20, 40, 80), (ax - 6, ay - 6 + 12), ring_mask)
-    img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(16)))
-    ring.paste((255, 255, 255, 255), (0, 0), ring_mask)
-    img.alpha_composite(ring, (ax - 6, ay - 6))
-    img.paste(_avatar(avatar_bytes, av, name), (ax, ay), _rr_mask(av, av, 46))
-
-    # ---- middle: status, name, username ------------------------------------
-    tx = ax + av + 50
-    max_text_w = 790 - tx - 20
-    pill_font = font(21, "medium")
-    pw = int(ImageDraw.Draw(Image.new("RGBA", (1, 1))).textlength(label, font=pill_font)) + 3 * (len(label) - 1) + 70
-    px0, py0 = tx, ay + 6
-    glass(img, (px0, py0, px0 + pw, py0 + 48), radius=24, alpha_top=70, alpha_bottom=40, blur=8)
+def _compose(st, name, username, status, approved, sold, points, avatar_bytes):
+    img = st["base"].copy()
     d = ImageDraw.Draw(img)
-    dot = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(dot).ellipse((px0 + 20, py0 + 15, px0 + 38, py0 + 33), fill=scolor + (255,))
-    img.alpha_composite(dot.filter(ImageFilter.GaussianBlur(5)))
-    ImageDraw.Draw(img).ellipse((px0 + 20, py0 + 15, px0 + 38, py0 + 33), fill=scolor + (255,))
-    spaced_text(img, (px0 + 52, py0 + 25), label, pill_font, (255, 255, 255, 235), spacing=3)
 
-    nm, nf = fit_text(name, max_text_w, 70, 38, "bold")
-    text(img, (tx, ay + 78), nm, nf, (255, 255, 255, 255))
+    pill, pos = _pill(st, status)
+    img.paste(pill, pos)
+
+    img.paste(_avatar(avatar_bytes, name), (AX, AY), st["av_mask"])
+
+    max_w = PC[0] - 24 - NAME_X
+    nm, nf = fit_text(name, max_w, 58, 32, "bold")
+    d.text((NAME_X, AY + 66), nm, font=nf, fill=WHITE, anchor="la")
     if username:
-        un, uf = fit_text("@" + username, max_text_w, 34, 22, "light")
-        text(img, (tx, ay + 78 + nf.size + 22), un, uf, (255, 255, 255, 190))
+        un, uf = fit_text("@" + username, max_w, 28, 18, "light")
+        d.text((NAME_X, AY + 66 + nf.size + 20), un, font=uf, fill=MUTED, anchor="la")
 
-    # ---- right: approved / sold glass panel ---------------------------------
-    gx0, gy0, gx1, gy1 = 810, MARGIN, W - MARGIN, MARGIN + 230
-    glass(img, (gx0, gy0, gx1, gy1), radius=38)
-    cats = ["LEGENDARY", "NON-LEG", "SHINY", "TMS"]
-    label_w = 140
-    col_w = (gx1 - gx0 - label_w - 20) / 4
-    head_y = gy0 + 42
-    for i, c in enumerate(cats):
-        cx = gx0 + label_w + col_w * i + col_w / 2
-        spaced_text(img, (cx, head_y), c, font(14, "medium"), (255, 255, 255, 165), spacing=1, anchor="m")
-    div = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(div).line((gx0 + 30, gy0 + 72, gx1 - 30, gy0 + 72), fill=(255, 255, 255, 70), width=2)
-    img.alpha_composite(div)
-    for r, (row_label, vals) in enumerate((("APPROVED", approved), ("SOLD", sold))):
-        cy = gy0 + 112 + r * 66
-        spaced_text(img, (gx0 + 34, cy), row_label, font(16, "medium"), (255, 255, 255, 190), spacing=2)
+    # Auction Points: big number with a soft glow
+    txt = f"{int(points):,}"
+    pf_txt, pf = fit_text(txt, PC[2] - 30 - NUM_X, 88, 44, "bold")
+    tw = int(text_w(pf_txt, pf))
+    pad, hh = 34, int(pf.size * 0.85)
+    rx0, ry0, rw, rh = NUM_X - pad, NUM_Y - hh - pad, tw + 2 * pad, 2 * hh + 2 * pad
+    gm = Image.new("L", (rw, rh), 0)
+    ImageDraw.Draw(gm).text((pad, rh // 2), pf_txt, font=pf, fill=255, anchor="lm")
+    img.paste(NUM_GLOW, (rx0, ry0), gm.filter(ImageFilter.GaussianBlur(13)).point(lambda v: int(v * 0.8)))
+    d.text((NUM_X, NUM_Y), pf_txt, font=pf, fill=NUM_COLOR, anchor="lm")
+
+    # Approved / Sold numbers (large)
+    vf = font(56, "medium")
+    for y, vals in zip(ROW_Y, (approved, sold)):
         for i, v in enumerate(vals):
-            cx = gx0 + label_w + col_w * i + col_w / 2
-            text(img, (cx, cy), str(v), font(40, "medium"), (255, 255, 255, 255), anchor="mm")
+            d.text((col_x(i), y), str(v), font=vf, fill=WHITE, anchor="mm")
+    return img
 
-    # ---- bottom: Auction Points (the highlight) ----------------------------
-    bx0, by0, bx1, by1 = MARGIN, 340, W - MARGIN, H - MARGIN
-    glass(img, (bx0, by0, bx1, by1), radius=44, alpha_top=70, alpha_bottom=34, blur=20)
-    # soft accent wash inside the card
-    wash = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(wash).ellipse((bx0 - 140, by0 - 80, bx0 + 560, by1 + 80), fill=ACCENT + (46,))
-    wash = wash.filter(ImageFilter.GaussianBlur(70))
-    clip = Image.new("L", (W, H), 0)
-    clip.paste(_rr_mask(bx1 - bx0, by1 - by0, 44), (bx0, by0))
-    wash.putalpha(ImageChops.multiply(wash.getchannel("A"), clip))
-    img.alpha_composite(wash)
 
-    cy = (by0 + by1) // 2
-    # star icon
-    sx = bx0 + 130
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).polygon(star(sx, cy + 4, 62, 26), fill=ACCENT + (170,))
-    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(20)))
-    big = Image.new("RGBA", (W * 2, H * 2), (0, 0, 0, 0))
-    ImageDraw.Draw(big).polygon(star(sx * 2, (cy + 4) * 2, 124, 52), fill=ACCENT + (255,))
-    img.alpha_composite(big.resize((W, H), Image.LANCZOS))
+_result_cache = OrderedDict()
+_cache_lock = threading.Lock()
+CACHE_SIZE = 32
 
-    spaced_text(img, (bx0 + 250, cy - 70), "AUCTION POINTS", font(24, "medium"), (255, 255, 255, 210), spacing=6)
-    pts = f"{int(points):,}"
-    glow_text(img, (bx0 + 246, cy + 16), pts, font(112, "bold"), ACCENT, anchor="lm")
 
-    # faint brand mark, bottom right of the card
-    spaced_text(img, (bx1 - 40, by1 - 38), "HEXA AUCTION", font(18, "medium"), (255, 255, 255, 110), spacing=5, anchor="r")
-
-    out = io.BytesIO()
-    img.convert("RGB").save(out, format="PNG", optimize=False)
-    out.name = "profile.png"
-    out.seek(0)
+def render_profile(name, username, status, approved, sold, points, avatar_bytes=None):
+    name = clean_name(name, fallback=clean_name(username, "User") if username else "User")
+    key = (name, username or "", status, tuple(approved), tuple(sold), int(points),
+           zlib.crc32(avatar_bytes) if avatar_bytes else 0)
+    with _cache_lock:
+        data = _result_cache.get(key)
+        if data is not None:
+            _result_cache.move_to_end(key)
+    if data is None:
+        img = _compose(_get_state(), name, username, status, approved, sold, points, avatar_bytes)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92, subsampling=0)
+        data = buf.getvalue()
+        with _cache_lock:
+            _result_cache[key] = data
+            while len(_result_cache) > CACHE_SIZE:
+                _result_cache.popitem(last=False)
+    out = io.BytesIO(data)
+    out.name = "profile.jpg"
     return out
 
 
 if __name__ == "__main__":
     import sys
+    t = time.time()
     buf = render_profile("Enryu", "enryu", "verified", [12, 48, 7, 3], [9, 30, 5, 2], 128)
-    with open(sys.argv[1] if len(sys.argv) > 1 else "preview.png", "wb") as f:
-        f.write(buf.read())
+    print("first render (includes one-time static layer):", round(time.time() - t, 2), "s")
+    t = time.time()
+    render_profile("Enryu", "enryu", "admin", [12, 48, 7, 3], [9, 30, 5, 2], 129)
+    print("next render:", round((time.time() - t) * 1000), "ms")
+    with open(sys.argv[1] if len(sys.argv) > 1 else "preview.jpg", "wb") as f:
+        f.write(buf.getvalue())
