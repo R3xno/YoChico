@@ -126,10 +126,12 @@ def validate_base(resp):
     return parse_amount(getattr(resp, "text", None))
 
 notacc = """Bid Not Accepted !
+
 ⁉️ | Reasons:
 ❖ Don't send an amount lower than the highest bid
 ❖ Don't send the same amount as the highest bid
 ❖ Follow Minimum Increase Bid Rule:
+
 +500 if current bid is under 50k
 +1k if current bid is 50k-100k
 +2k if current bid is over 100k"""
