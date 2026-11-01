@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 
 from telethon import events, Button
 from telethon.tl.functions.users import GetFullUserRequest as GetFullUser
@@ -458,14 +459,14 @@ async def bcast(event):
 # Public command
 # ---------------------------------------------------------------------------
 PROFILE_ROWS = (("Legendary", 0), ("Non-Legendary", 1), ("Shiny", 2), ("TMs", 3))
-PROFILE_RULE = "─" * 26
 
 
 def _profile_section(title, counts):
-    lines = [f" {title:<21}{sum(counts):>4}"]
-    for label, idx in PROFILE_ROWS:
-        lines.append(f"   {label:<19}{counts[idx]:>4}")
-    return "\n".join(lines)
+    """Bold title + total, then a quote with only the types that are not 0."""
+    total = sum(counts)
+    rows = [f"{label} — {counts[idx]}" for label, idx in PROFILE_ROWS if counts[idx]]
+    body = "\n".join(rows) if rows else "Nothing yet"
+    return f"<b>{title}</b> · {total}\n<blockquote>{body}</blockquote>"
 
 
 @client.on(events.NewMessage(pattern=r"^/profile\b"))
@@ -479,14 +480,15 @@ async def profile(event):
         uid = event.sender_id
 
     # Always show the user's name as a deep link, never the raw ID
-    username = await get_mention(uid)
+    name = html_lib.escape(str(await get_first_name(uid)))
+    username = f'<a href="tg://user?id={int(uid)}">{name}</a>'
 
     if uid in admins or uid in OWNERS:
-        role = "Admin"
+        post = "👑 Admin"
     elif uid in verified:
-        role = "Verified"
+        post = "✅ Verified"
     else:
-        role = "Not verified"
+        post = "❌ Not verified"
 
     # Currently listed in the live auction
     listed = [0, 0, 0, 0]
@@ -503,11 +505,8 @@ async def profile(event):
         if bidders and bidders[-1] == uid and t in (0, 1, 2, 3):
             bought[t] += 1
 
-    body = "\n".join([
-        PROFILE_RULE,
-        _profile_section("BOUGHT", bought),
-        PROFILE_RULE,
-        _profile_section("LISTED", listed),
-        PROFILE_RULE,
-    ])
-    await event.reply(f"{username}  ·  {role}\n\n```\n{body}\n```", link_preview=False)
+    text = (f"{username} {post}\n\n"
+            f"{_profile_section('Bought', bought)}\n\n"
+            f"{_profile_section('Listed', listed)}")
+    await event.reply(text, parse_mode="html", link_preview=False)
+    
