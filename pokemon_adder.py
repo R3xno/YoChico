@@ -1,871 +1,511 @@
-import os, random, string, uuid, time, re, html, asyncio
+import asyncio
+import html as html_lib
 
-import telethon
 from telethon import events, Button
-from bot import client, config, pending_pokes, auction_pokes, admin_grp_id, auction_channel_id, user_cache, \
-    bot_username, verified, bid_banned, sub_banned, user_db, bid_logs_id, admins, rejected_pokes
-from imagekitio import ImageKit
-import requests
-import traceback
+from telethon.tl.functions.users import GetFullUserRequest as GetFullUser
+from telethon.tl.types import InputUser
 
-imagekit =ImageKit(
-    private_key='private_Vs/dcHjiR+ckec+n2izKPqzrTo0=',
-    public_key='public_yeK8u/vouKfLmcyMbwJ72fxBWUc=',
-    url_endpoint='https://ik.imagekit.io/HEXAAUCTION'
-)
+from bot import client, config, admins, verified, bid_banned, sub_banned, auction_pokes, auction_channel_id, \
+    bot_username, user_db, previous_data, final_logs_id, rejected_pokes
+from pokemon_adder import item_link, update_bid_post, close_bid_post
 
-def upload_file_imagekit(file_path):
+# Bot owners (always allowed, can add/remove admins)
+OWNERS = [8511293134, 1101488645]
+
+
+# ---------------------------------------------------------------------------
+# Permission checks
+# NOTE: Telethon freezes `from_users=admins` when the handler is registered,
+# so admins added later (via /addadmin) were NOT recognised until a restart.
+# Using `func=` checks the live `admins` list on every message instead.
+# ---------------------------------------------------------------------------
+def owner_only(event):
+    return event.sender_id in OWNERS
+
+
+def admin_only(event):
+    return event.sender_id in admins or event.sender_id in OWNERS
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+async def get_target(event):
+    """Return (user_id, error). Works with reply, numeric id, @username or username."""
+    if event.is_reply:
+        replied = await event.get_reply_message()
+        if replied and replied.sender_id:
+            return replied.sender_id, None
+        return None, "Couldn't read the user from the replied message."
+
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None, "Reply to a user or provide a user ID or @username."
+
+    arg = parts[1].strip()
+    if arg.lstrip("-").isdigit():
+        return int(arg), None
     try:
-        with open(file_path, 'rb') as file:
-            upload_response = imagekit.upload(
-                file=file,
-                file_name=str(uuid.uuid4()),
-            )
-        return (vars(upload_response))["url"]
+        peer = await client.get_entity(arg.lstrip("@"))
+        return peer.id, None
     except Exception as e:
-        return "None"
-    finally:
-        os.remove(file_path)
+        return None, f"❌ Error getting user {arg}: {e}"
 
 
-def user_link(user):
-    """HTML deep link to the user's profile, shown by name (never the raw id)."""
-    import html
-    name = html.escape(user.first_name or "User")
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
-
-
-async def md_mention(user_id):
-    """Markdown deep link by name for a user id."""
-    try:
-        u = await client.get_entity(user_id)
-        name = (u.first_name or "User").replace("[", "(").replace("]", ")")
-    except Exception:
-        name = "User"
-    return f"[{name}](tg://user?id={user_id})"
-
-
-# ---------------------------------------------------------------------------
-# Channel / group config  (change here if names change again)
-# ---------------------------------------------------------------------------
-AUCTION_CHANNEL = "HexaAuction"      # auction channel username (no @)
-TRADE_GROUP = "HexaAuctionGc"        # trade group username (no @)
-
-
-def item_link(poke):
-    """Always build the post link with the CURRENT channel username.
-    Old items saved with the old channel name get fixed automatically
-    because only the message id is taken from the stored link."""
-    mid = poke.get("msg_id")
-    if mid is None:
-        try:
-            mid = int(str(poke.get("link", "")).rstrip("/").split("/")[-1])
-        except (ValueError, TypeError):
-            return f"https://t.me/{AUCTION_CHANNEL}"
-    return f"https://t.me/{AUCTION_CHANNEL}/{mid}"
-
-
-def bid_url(token):
-    """Deep link that opens the bot to bid on an item."""
-    return f"https://t.me/{str(bot_username).lstrip('@')}?start={token}"
-
-
-def already_handled(event, name):
-    """True if this exact message was already handled (stops double replies,
-    even if the handler got registered twice)."""
-    seen = getattr(client, "_seen_cmds", None)
-    if seen is None:
-        seen = client._seen_cmds = {}
-    now = time.time()
-    for k, t in list(seen.items()):
-        if now - t > 120:
-            seen.pop(k, None)
-    key = (name, event.chat_id, event.id)
-    if key in seen:
-        return True
-    seen[key] = now
-    return False
-
-
-@client.on(events.NewMessage(pattern=r"^/add(@\w+)?$"))
-async def yescb(event):
-    sender = await event.get_sender()
-    kekz = user_db.find_one({"_id": sender.id})
-    if kekz is None:
-        pass
-        user_db.insert_one({"_id": sender.id, "hash": sender.access_hash})
-    res = config.find_one({"_id": 0})
-    current_state = res.get("entry", False)
-    if not current_state:
-        return await event.reply("Submission is turned off")
-    if not event.is_private:
-        return await event.reply("Use in dm")
-    if event.sender_id in sub_banned:
-        return await event.reply("You are banned from submission...")
-    await event.reply("So what would you like to sell?"
-        ,
-        buttons=[
-        [
-            Button.inline('LEGENDARY', 'legendary')
-        ],
-        [
-            Button.inline('0L/NON LEGENDARY', '0L')
-        ],
-        [
-            Button.inline('SHINY', 'shiny')
-        ],
-        [
-            Button.inline('TMS', 'tms')
-        ]
-     ]
-    )
-
-
-def validate_base(resp):
-    """Accepts a message; returns int amount or False."""
-    return parse_amount(getattr(resp, "text", None))
-
-notacc = """Bid Not Accepted !
-
-⁉️ | Reasons:
-❖ Don't send an amount lower than the highest bid
-❖ Don't send the same amount as the highest bid
-❖ Follow Minimum Increase Bid Rule:
-
-+500 if current bid is under 50k
-+1k if current bid is 50k-100k
-+2k if current bid is over 100k"""
-WELCOME_IMG = None
-try:
-    _r = requests.get("https://ik.imagekit.io/cocogoat/1037179104-10000035_hAj39hAZg", timeout=15)
-    # only keep it if it is really an image (not an error page)
-    if _r.status_code == 200 and _r.headers.get("content-type", "").startswith("image/"):
-        with open("temp.jpg", "wb") as handler:
-            handler.write(_r.content)
-        WELCOME_IMG = "temp.jpg"
-    else:
-        print("Welcome image download failed:", _r.status_code, _r.headers.get("content-type"))
-except Exception as _e:
-    print("Welcome image download error:", _e)
-
-# ---------------------------------------------------------------------------
-# Bid helpers (shared by the /start deep-link flow and the group /bid command)
-# ---------------------------------------------------------------------------
-AUCTION_CHANNEL_ID = -1001450650460   # channel where item posts are made
-BID_GROUP_ID = -1001207853384         # linked discussion group (reply-bidding)
-MEDIA_CAPTION_LIMIT = 1024
-
-_bid_lock = None
-
-
-def _get_lock():
-    global _bid_lock
-    if _bid_lock is None:
-        _bid_lock = asyncio.Lock()
-    return _bid_lock
-
-
-def parse_amount(value):
-    """'1000', '1,000', '1k', '1.5k' -> int.  Returns False if invalid."""
-    if value is None:
-        return False
-    s = str(value).strip().lower().replace(",", "").replace("_", "")
-    if not s:
-        return False
-    mult = 1
-    if s.endswith("k"):
-        mult = 1000
-        s = s[:-1]
-    try:
-        n = int(round(float(s) * mult))
-    except (ValueError, OverflowError):
-        return False
-    return n if n > 0 else False
-
-
-def display_name(user):
-    return (getattr(user, "first_name", None) or "User")
-
-
-def bid_box(amount, by_html):
-    return ("╭────────────────╮\n"
-            f"    Highest Bid: {amount} Pd\n"
-            f"    By: {by_html}\n"
-            "╰────────────────╯")
-
-
-def _visible_len(text):
-    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
-
-
-def compose_post(base_text, amount, by_html, is_media):
-    """Item post + the highest-bid box in ONE message (HTML)."""
-    text = f"{base_text}\n\n{bid_box(amount, by_html)}"
-    if is_media and _visible_len(text) > MEDIA_CAPTION_LIMIT:
-        text = f"{base_text}\n{bid_box(amount, by_html)}"
-    return text
-
-
-async def update_bid_post(doc, amount, by_id=None, by_name=None):
-    """Refresh the 'Highest Bid / By' box of an item.
-    New items  -> the box lives inside the item post itself.
-    Old items  -> (posted before the merge) the separate bid post is edited."""
-    token = doc["token"]
-    ended = bool(doc.get("ended"))
-    if by_id is not None and not by_name:
-        try:
-            by_name = display_name(await client.get_entity(by_id))
-        except Exception:
-            by_name = "User"
-    try:
-        if doc.get("combined"):
-            if by_id is None:
-                by_html = "No one right now!"
-            else:
-                by_html = f'<a href="tg://user?id={int(by_id)}">{html.escape(str(by_name))}</a>'
-            text = compose_post(doc["text"], amount, by_html, doc["tipe"] < 3)
-            buttons = Button.clear() if ended else [[Button.url("Bid", bid_url(token))]]
-            await client.edit_message(auction_channel_id, doc["msg_id"], text,
-                                      parse_mode="html", buttons=buttons, link_preview=False)
-        else:
-            if by_id is None:
-                by = "No one right now!"
-            else:
-                nm = str(by_name).replace("[", "(").replace("]", ")")
-                by = f"[{nm}](tg://user?id={int(by_id)})"
-            buttons = Button.clear() if ended else [[Button.inline("Refresh", f"refresh|{token}"),
-                                                     Button.url("Bid", bid_url(token))]]
-            await client.edit_message(auction_channel_id, doc["bmid"], bid_box(amount, by),
-                                      buttons=buttons)
-    except telethon.errors.MessageNotModifiedError:
-        pass
-
-
-async def close_bid_post(doc):
-    """Remove the Bid button when the auction ends."""
-    mid = doc.get("msg_id") if doc.get("combined") else doc.get("bmid")
-    if not mid:
-        return
-    try:
-        await client.edit_message(auction_channel_id, mid, buttons=Button.clear())
-    except Exception:
-        pass
-
-
-def current_bid(doc):
-    bids = doc.get("bids") or []
-    bidders = doc.get("bidders") or []
-    if not bids:
-        return doc["base"], None
-    return int(bids[-1]), (bidders[-1] if bidders else None)
-
-
-def precheck_bid(sender_id, token):
-    """Returns (error_message_or_None, item_doc_or_None)."""
-    res = config.find_one({"_id": 0}) or {}
-    if not res.get("bid", False):
-        return "Bid disabled right now.", None
-    if sender_id not in verified:
-        return "Not verified. Please get yourself verifed by admins in @HexaAuctionGc", None
-    if sender_id in bid_banned:
-        return "You are banned from bidding", None
-    doc = auction_pokes.find_one({"token": token})
-    if doc is None or doc.get("ended"):
-        return "This item is no longer available.", None
-    if sender_id == doc["user_id"]:
-        return "Seller isnt allowed to bid", None
-    return None, doc
-
-
-def bid_allowed(last_bid, amount):
-    diff = amount - last_bid
-    if diff <= 0:
-        return False
-    if last_bid <= 50000:
-        return diff >= 500
-    if last_bid <= 100000:
-        return diff >= 1000
-    return diff >= 2000
-
-
-async def submit_bid(sender, token, amount):
-    """Validate + store a bid (same rules for button flow and /bid command).
-    Returns (ok, message, info)."""
-    async with _get_lock():
-        err, doc = precheck_bid(sender.id, token)
-        if err:
-            return False, err, None
-        last_bid, last_bidder = current_bid(doc)
-        if not bid_allowed(last_bid, amount):
-            return False, notacc, None
-        auction_pokes.update_one({"token": token},
-                                 {"$push": {"bids": amount, "bidders": sender.id}})
-    return True, "Bid placed successfully.", {
-        "doc": doc, "amount": amount, "last_bid": last_bid, "last_bidder": last_bidder}
-
-
-def _poke_lines(doc):
-    if doc["tipe"] < 3:
-        return (f"🔹 **Pokemon:** {doc['pokemon_name']} [🔗🔗🔗]({item_link(doc)})\n"
-                f"🌿 **Nature:** {doc['nature']}\n")
-    return (f"🔹 {doc['pokemon_name']} [🔗🔗🔗]({item_link(doc)})\n"
-            f"🌿 {doc['nature']}\n")
-
-
-async def announce_bid(sender, doc, amount, last_bid, last_bidder):
-    """Update the post, write the bid log and notify the outbid user."""
-    name = display_name(sender)
-    try:
-        await update_bid_post(doc, amount, sender.id, name)
-    except Exception as e:
-        print("bid post update failed:", e)
-
-    who = f"[{_clean(name)}](tg://user?id={sender.id})"
-    lines = _poke_lines(doc)
-    log = (f"🎉 {who} just bid\n\n" + lines + "\n"
-           f"📈 **Current Bid:** {amount}\n"
-           f"💸 **Last Bid:** {last_bid}\n"
-           f"📊 **Outbid By:** {amount - last_bid}\n\n")
-    try:
-        await client.send_message(bid_logs_id, log)
-    except Exception as e:
-        print("bid log failed:", e)
-
-    if last_bidder and last_bidder != sender.id:
-        dm = (f"🎉 {who} just outbid you!\n\n" + lines + "\n"
-              f"💸 **Your Bid:** {last_bid}\n"
-              f"📈 **Current Bid:** {amount}\n"
-              f"📊 **Outbid By:** {amount - last_bid}\n\n"
-              f"🔥 Hurry and place a higher bid to stay in the game!")
-        try:
-            await client.send_message(last_bidder, dm,
-                                      buttons=[[Button.url("🛒 Bid Now", bid_url(doc["token"]))]])
-        except Exception as e:
-            print("outbid dm failed:", e)
-
-
-def item_from_reply(reply):
-    """Find the auction item for a message in the discussion group that is the
-    auto-forward of an item post from the auction channel."""
-    if reply is None:
-        return None
-    fwd = getattr(reply, "fwd_from", None)
-    post_id = getattr(fwd, "channel_post", None)
-    if not post_id:
-        return None
-    ch = getattr(getattr(fwd, "from_id", None), "channel_id", None)
-    if ch is not None and ch != abs(AUCTION_CHANNEL_ID) - 10 ** 12:
-        return None
-    return auction_pokes.find_one({"$or": [{"msg_id": post_id}, {"bmid": post_id}]})
-
-
-@client.on(events.NewMessage(chats=BID_GROUP_ID, pattern=r"(?i)^/bid(?:@\w+)?\s+(\S+)\s*$"))
-async def group_bid(event):
-    """/bid 1k  or  /bid 1000  as a reply to the item post in the group."""
-    if already_handled(event, "gbid"):
-        return
-    arg = event.pattern_match.group(1)
-    if arg.lower() in ("on", "off"):      # admin toggle, handled in admin_funcs
-        return
-    if not event.is_reply:
-        return await event.reply("Reply to an item post with /bid amount  (e.g. /bid 1k)")
-    reply = await event.get_reply_message()
-    doc = item_from_reply(reply)
-    if doc is None:
-        return await event.reply("Reply to an auction item post to place a bid.")
-    amount = parse_amount(arg)
-    if not amount:
-        return await event.reply("Wrong bid format. Use /bid 1000 or /bid 1k")
-    sender = await event.get_sender()
-    if sender is None:
-        return
-    ok, msg, info = await submit_bid(sender, doc["token"], amount)
-    await event.reply(msg)
-    if ok:
-        if user_db.find_one({"_id": sender.id}) is None:
-            try:
-                user_db.insert_one({"_id": sender.id, "hash": sender.access_hash})
-            except Exception:
-                pass
-        await announce_bid(sender, **info)
-
-
-@client.on(events.NewMessage(pattern=r"^/start\b"))
-async def start(event):
-    sender = await event.get_sender()
-    kekz = user_db.find_one({"_id": sender.id})
-    if kekz is None:
-        user_db.insert_one({"_id": sender.id, "hash": sender.access_hash})
-    _parts = event.raw_text.split()
-    if len(_parts) < 2:
-        welcome_text = """Welcome to HeXa Auction Bot
-This bot is used to manage auctions in @HexaAuction ( Based on Slow Auctions )
-
-⚠️ Must join Both Channel & Groups
-Auction Group
-               ╰┈➤ @HexaAuction
-
-Auction Trade Group
-               ╰➤ @HexaAuctionGc
-
-Use /add to add your items for auction."""
-        welcome_buttons = [[Button.url("Auction Channel", f"https://t.me/{AUCTION_CHANNEL}"), Button.url("Trade Group", f"https://t.me/{TRADE_GROUP}")]]
-        try:
-            if WELCOME_IMG:
-                await event.reply(welcome_text, file=WELCOME_IMG, buttons=welcome_buttons)
-            else:
-                await event.reply(welcome_text, buttons=welcome_buttons)
-        except Exception as e:
-            print("Welcome image send failed:", e)
-            await event.reply(welcome_text, buttons=welcome_buttons)
-        return
-
-    token = _parts[1]
-    err, hmm = precheck_bid(sender.id, token)
+async def add_user(event, lst, field, already_msg, done_msg="Done"):
+    uid, err = await get_target(event)
     if err:
         return await event.reply(err)
-    last_bid, _ = current_bid(hmm)
-
-    async with client.conversation(event.sender_id) as conv:
-        await conv.send_message(f'Enter bid for {hmm["pokemon_name"]}.\nLast bid: {last_bid}')
-        response = await conv.get_response(timeout=90000)
-        amount = parse_amount(response.text)
-        if not amount:
-            await client.send_message(event.sender_id, 'Wrong bid format',
-                                      buttons=[[Button.url("Bid Again", bid_url(token))]])
-            return
-        ok, msg, info = await submit_bid(sender, token, amount)
-        if not ok:
-            await conv.send_message(msg)
-            return
-        await event.reply(msg)
-        await announce_bid(sender, **info)
+    if uid in lst:
+        return await event.reply(already_msg)
+    lst.append(uid)
+    config.update_one({"_id": 0}, {"$addToSet": {field: uid}}, upsert=True)
+    await event.reply(done_msg)
 
 
-@client.on(events.CallbackQuery(func=lambda e: (
-    e.data in [b"legendary", b"shiny", b"0L", b"tms", b"delete"] or(isinstance(e.data, bytes) and (e.data.startswith(b"submit|") or e.data.startswith(b"delete|"))))))
-async def handle_specific_callbacks(event):
+async def remove_user(event, lst, field, not_in_msg, done_msg):
+    uid, err = await get_target(event)
+    if err:
+        return await event.reply(err)
+    if uid not in lst:
+        return await event.reply(not_in_msg)
+    lst.remove(uid)
+    config.update_one({"_id": 0}, {"$pull": {field: uid}}, upsert=True)
+    await event.reply(done_msg)
 
-    data = event.data.decode("utf-8")
 
-    if data == "legendary":
-        await event.delete()
-        await event.answer("⚝ Legendary selected!", alert=False)
-        await add_pokemon(event, 0)
-    elif data == "shiny":
-        await event.delete()
-        await event.answer("✨ Shiny selected!", alert=False)
-        await add_pokemon(event, 2)
-    elif data == "0L":
-        await event.delete()
-        await event.answer("⭕ 0L selected!", alert=False)
-        await add_pokemon(event, 1)
-    elif data == "tms":
-        await event.delete()
-        await event.answer("⭕ TMs", alert=False)
-        await add_tms(event, 3)
-    elif "submit" in data:
-        damn = data.split("|")[1]
-        if damn not in user_cache:
-            return await event.answer("Session expired. Please use /add again.", alert=True)
-        await event.edit(buttons=Button.clear())
-        if user_cache[damn]["tipe"] < 3:
-            pending_pokes.insert_one({k: v for k, v in user_cache[damn].items() if k != 'image'})
-        else:
-            pending_pokes.insert_one(user_cache[damn])
-        buttons = [[
-            Button.inline("Accept", f"accept|{damn}"),
-            Button.inline("Bad IVS", f"rej|ivs|{damn}")
-        ],
-            [
-                Button.inline("Wrong info", f"rej|info|{damn}"),
-                Button.inline("Bad Nature", f"rej|nature|{damn}")
-            ], [
-                Button.inline("Missing Moves", f"rej|moves|{damn}"),
-                Button.inline("Over priced", f"rej|base|{damn}")
-            ]]
-        if user_cache[damn]["tipe"] <3:
-            await client.send_file(admin_grp_id, file=user_cache[damn]["image"], caption=user_cache[damn]["text"],
-                               parse_mode="html", buttons = buttons)
-        else:
-            await client.send_message(admin_grp_id, user_cache[damn]["text"],parse_mode="html", buttons=buttons)
-        await event.answer("Done!", alert=False)
-    elif data == "delete":
-        await event.delete()
+def get_auction_state():
+    res = config.find_one({"_id": 0}) or {}
+    return res.get("auction", False)
 
-from telethon import events, Button
 
-@client.on(events.CallbackQuery(func=lambda e: isinstance(e.data, bytes) and e.data.startswith(b"rej|")))
-async def handle_rejection_reasons(event):
-    if event.sender_id not in admins:
-        await event.answer("You're not allowed to do this.", alert=True)
-        return
-    data_str = event.data.decode()  # convert bytes to string
-    parts = data_str.split("|")
-    if len(parts) < 3:
-        await event.answer("Invalid rejection data!", alert=True)
-        return
-    reason = parts[1]  # e.g., "ivs", "info", etc.
-    ref_id = parts[2]  # e.g., the value of `damn`
-    reason_map = {
-        "ivs": "Bad IVs",
-        "info": "Wrong info",
-        "nature": "Bad Nature",
-        "moves": "Missing Moves",
-        "base": "Overpriced",
-    }
-    res = pending_pokes.find_one_and_delete({"token":ref_id})
-    
-    readable_reason = reason_map.get(reason, "Unknown reason")
-    if res is None:
-        await event.answer("This item is already processed.", alert=True)
-        return
-    res["reason"] = readable_reason
-    rejected_pokes.insert_one(res)
-    text = f"Rejected {res['nature']} {res['pokemon_name']} cause {readable_reason}"
-    await client.send_message(entity = res["user_id"], message=text)
-    await event.edit(buttons=Button.clear())
-    await event.reply(f"Rejected by {await md_mention(event.sender_id)}")
-    user_cache.pop(ref_id, None)
+async def toggle_setting(event, key, label):
+    """Toggle entry/bid. Locked (cannot be changed) while the auction is off."""
+    action = event.pattern_match.group(1).lower()
 
-@client.on(events.CallbackQuery(func=lambda e: isinstance(e.data, bytes) and e.data.startswith(b"accept|")))
-async def handle_accept(event):
-    if event.sender_id not in admins:
-        await event.answer("You're not allowed to do this.", alert=True)
-        return
-    ref_id = event.data.decode().split("|", 1)[1]
-    hmm = pending_pokes.find_one_and_delete({"token": ref_id})
-    if not hmm or not isinstance(hmm, dict):
-        await event.answer("This token is invalid or already processed.", alert=True)
-        return
-    auction_pokes.insert_one(hmm)
-    kekz = await event.get_message()
+    if not get_auction_state():
+        return await event.reply(
+            f"🔒 Auction is off, so {label} is locked.\n"
+            f"Start the auction with /auction on to open it."
+        )
+
+    res = config.find_one({"_id": 0}) or {}
+    current_state = res.get(key, False)
+
+    if action == "on":
+        if current_state:
+            return await event.reply(f"{label} is already enabled.")
+        config.update_one({"_id": 0}, {"$set": {key: True}}, upsert=True)
+        await event.reply(f"{label} has been enabled.")
+    else:
+        if not current_state:
+            return await event.reply(f"{label} is already disabled.")
+        config.update_one({"_id": 0}, {"$set": {key: False}}, upsert=True)
+        await event.reply(f"{label} has been disabled.")
+
+
+async def get_first_name(user_id):
+    """Best-effort lookup of a user's first name."""
+    user_id = int(user_id)
+    # 1) Using the stored access hash
     try:
-        lulz = await client.get_entity(auction_channel_id)
+        target = user_db.find_one({"_id": user_id})
+        if target:
+            user = await client(GetFullUser(InputUser(user_id=target["_id"], access_hash=target["hash"])))
+            return user.users[0].first_name
     except Exception:
-        lulz = auction_channel_id
-
-    is_media = hmm['tipe'] < 3
-    spoiler = hmm['tipe'] == 2
-    markup = [[Button.url("Bid", bid_url(ref_id))]]
-    media = None
-    if is_media:
-        media = telethon.utils.get_input_media(kekz.media)
-        media.spoiler = spoiler
-
-    # Item post + highest-bid box are ONE post now, with a single Bid button.
-    combined = True
-    bmid = None
-    post_text = compose_post(hmm["text"], hmm['base'], "No one right now!", is_media)
+        pass
+    # 2) Fallback to Telethon's entity cache / lookup
     try:
-        if is_media:
-            m = await client.send_file(lulz, caption=post_text, file=media, parse_mode="html",
-                                       spoiler=spoiler, buttons=markup)
-        else:
-            m = await client.send_message(lulz, post_text, parse_mode="html",
-                                          buttons=markup, link_preview=False)
-    except (telethon.errors.MediaCaptionTooLongError, telethon.errors.MessageTooLongError):
-        # Post too long to carry the bid box -> fall back to the old 2-post layout.
-        combined = False
-        if is_media:
-            m = await client.send_file(lulz, caption=hmm["text"], file=media, parse_mode="html",
-                                       spoiler=spoiler)
-        else:
-            m = await client.send_message(lulz, hmm["text"], parse_mode="html", link_preview=False)
-        bm = await m.reply(bid_box(hmm['base'], "No one right now!"),
-                           buttons=[[Button.inline("Refresh", f"refresh|{ref_id}"),
-                                     Button.url("Bid", bid_url(ref_id))]])
-        bmid = bm.id
-
-    auction_pokes.find_one_and_update(
-        {"token": ref_id},
-        {"$set": {"link": f"https://t.me/{AUCTION_CHANNEL}/{m.id}", "msg_id": m.id,
-                  "bmid": bmid, "combined": combined}})
-    await event.edit(buttons=Button.clear())
-    await event.reply(f"Approved by {await md_mention(event.sender_id)}")
-    user_cache.pop(ref_id, None)
+        entity = await client.get_entity(user_id)
+        return entity.first_name or "User"
+    except Exception:
+        return "User"
 
 
-def generate_alphanumeric_string(length=5):
-    characters = string.ascii_letters + string.digits  # a-zA-Z0-9
-    return ''.join(random.choices(characters, k=length))
-
-async def add_tms(event, tipe):
-    entry = config.find_one({"_id": 0}).get("entry", False)
-    if not event.is_private or not entry:
-        return
-
-    user_id = event.sender_id
-    user_data = {"user_id": user_id, "bids": [], "bidders": []}
-    cancelled = False
-
-    async with client.conversation(user_id) as conv:
-        try:
-            async def get_valid_response(prompt, validate):
-                nonlocal cancelled
-                while True:
-                    await conv.send_message(prompt)
-                    resp = await conv.get_response(timeout=900000)
-                    if resp.text.lower() == "/cancel":
-                        await conv.send_message("❌ Operation cancelled.")
-                        cancelled = True
-                        return None
-                    if validate(resp):
-                        return resp
-                    await conv.send_message("❗ Invalid input. Try again or type /cancel to abort.")
-
-            def validate_tm(resp):
-                return (resp.fwd_from and
-                        resp.fwd_from.from_id.user_id == 572621020 and
-                        "Power" in resp.raw_text and "Accuracy" in resp.raw_text and "💿" in resp.raw_text)
-            nature_resp = await get_valid_response("Forward Tm from bot", validate_tm)
-            if cancelled: return
-            user_data["info"] = nature_resp.raw_text.split("\n")[3]
-            user_data["nature"] = nature_resp.raw_text.split("\n")[2]
-            user_data["pokemon_name"] = nature_resp.raw_text.split("\n")[0]
+async def get_mention(user_id):
+    """Return a markdown mention: [Name](tg://user?id=ID) - no raw IDs shown."""
+    name = await get_first_name(user_id)
+    name = str(name).replace("[", "(").replace("]", ")")
+    return f"[{name}](tg://user?id={int(user_id)})"
 
 
-            base_resp = await get_valid_response("Set base:", validate_base)
-            if cancelled: return
-            user_data["base"] = validate_base(base_resp)
-            token = generate_alphanumeric_string()
-            username_line = f"<b>Username</b>- @{event.sender.username}\n" if event.sender.username else ""
-            summary = (
-                f"<blockquote>TMs</blockquote>\n"
-                f"<blockquote>{user_data['pokemon_name']}\n"
-                f"{user_data['nature']}\n"
-                f"{user_data['info']}</blockquote>\n"
-                f"<blockquote><b>User</b> - {user_link(event.sender)}\n"
-                f"{username_line}"
-                f"Base - {user_data['base']}</blockquote>\n"
-                f"Item ID - <code>{token}</code>"
-            )
-            user_data["text"] = summary
-            user_data["tipe"] = 3
-            user_data["token"] = token
-            user_cache[token] = user_data
-            await conv.send_message(summary, parse_mode="html",
-                                 buttons=[[Button.inline('SUBMIT', f'submit|{token}')],
-                                          [Button.inline('DELETE', 'delete')]])
-        except Exception as e:
-            await conv.send_message("❌ An unexpected error occurred: " + str(e))
-
-
-async def add_pokemon(event, tipe):
-    entry = config.find_one({"_id": 0}).get("entry", False)
-    if not event.is_private or not entry:
-        return
-
-    user_id = event.sender_id
-    user_data = {"user_id": user_id, "bids":[], "bidders":[]}
-    cancelled = False
-
-    async with client.conversation(user_id) as conv:
-        try:
-            async def get_valid_response(prompt, validate):
-                nonlocal cancelled
-                while True:
-                    await conv.send_message(prompt)
-                    resp = await conv.get_response(timeout=900000)
-                    if resp.text.lower() == "/cancel":
-                        await conv.send_message("❌ Operation cancelled.")
-                        cancelled = True
-                        return None
-                    if validate(resp):
-                        return resp
-                    await conv.send_message("❗ Invalid input. Try again or type /cancel to abort.")
-
-            name_resp = await get_valid_response("Enter Pokémon name:", lambda r: len(r.text) >= 2)
-            if cancelled: return
-            user_data["pokemon_name"] = name_resp.text
-
-            def validate_nature(resp):
-                return (resp.media and
-                        resp.fwd_from and
-                        resp.fwd_from.from_id.user_id == 572621020 and
-                        "| Nature:" in resp.raw_text)
-            nature_resp = await get_valid_response("Forward Nature Pic of Pokémon:", validate_nature)
-            if cancelled: return
-            user_data["nature"] = nature_resp.raw_text.split("Exp.")[0].split("\n")[0].split("Nature: ")[1]
-            user_data["level"] = nature_resp.raw_text.split("Exp.")[0].split("Lv. ")[1].split("|")[0]
-
-            # Step 3: EVs
-            def validate_evs(resp):
-                return resp.media and "Points" in resp.raw_text and "IV" in resp.raw_text and resp.fwd_from.from_id.user_id == 572621020
-            evs_resp = await get_valid_response("Forward EVs Pic of Pokémon:", validate_evs)
-            if cancelled: return
-            user_data["evs"] = evs_resp.raw_text
-            user_data["image"] = evs_resp.media
-            #downloaded_path = await evs_resp.download_media()
-            """link = upload_file_imagekit(downloaded_path)
-            user_data["im_link"] = link"""
-
-            def validate_moveset(resp):
-                return resp.media and "Power" in resp.raw_text and "Accuracy" in resp.raw_text and resp.fwd_from.from_id.user_id == 572621020
-            moveset_resp = await get_valid_response("Forward Moveset Pic:", validate_moveset)
-            if cancelled: return
-            user_data["moveset"] = moveset_resp.raw_text
-
-            # Step 5: Boosted
-            boosted_resp = await get_valid_response("Is any stat boosted? (If Yes, mention all in one message)", lambda r: len(r.text.strip()) > 0)
-            if cancelled: return
-            user_data["boosted"] = boosted_resp.text
-
-            # Step 6: Base
-            base_resp = await get_valid_response("Set base:", validate_base)
-            if cancelled: return
-            user_data["base"] = validate_base(base_resp)
-
-            poke_tipe = {0:"LEGENDARY", 2:"SHINY", 1:"0L"}
-            token = generate_alphanumeric_string()
-            user_data["token"] = token
-
-            username_line = f"<b>Username</b>- @{event.sender.username}\n" if event.sender.username else ""
-            summary = (
-                f"<blockquote>{poke_tipe[tipe]}</blockquote>\n"
-                f"<blockquote>Pokemon Name - {user_data['pokemon_name']}\n"
-                f"Level - {user_data['level']}\n"
-                f"Nature - {user_data['nature']}</blockquote>\n"
-                f"<code>{user_data['evs']}</code>\n\n"
-                f"{user_data['moveset']}\n"
-                f"<blockquote><b>User</b> - {user_link(event.sender)}\n"
-                f"{username_line}"
-                f"Boosted - {user_data['boosted']}\n"
-                f"Base - {user_data['base']}</blockquote>\n"
-                f"Item ID - <code>{token}</code>"
-            )
-            user_data["text"] = summary
-            user_data["tipe"] = tipe
-            user_cache[token] = user_data
-            await conv.send_file(file=user_data['image'], caption=summary, parse_mode="html",
-                                 buttons=[[Button.inline('SUBMIT', f'submit|{token}')],
-                                          [Button.inline('DELETE', 'delete')]])
-        except Exception as e:
-            await conv.send_message("❌ An unexpected error occurred: " + str(e))
-
-MAX_LEN = 3900
-TYPE_ORDER = [
-    (0, "🌟 Legendary"),
-    (1, "🐉 Non-Legendary"),
-    (2, "✨ Shiny"),
-    (3, "📚 TMs"),
-]
-
-
-def _clean(s):
+def clean_md(s):
     return str(s).replace("[", "").replace("]", "")
 
 
-def _item_line(poke):
-    return f"🔹 [{_clean(poke['pokemon_name'])} - {_clean(poke['nature'])}]({item_link(poke)})\n"
-
-
-def _build_list(header, items):
-    """Build the list text and keep it under Telegram's message limit."""
-    text = header
-    shown = 0
-    for poke in items:
+def validate_base(base):
+    try:
+        return int(base)
+    except (ValueError, TypeError):
         try:
-            line = _item_line(poke)
-        except Exception as e:
-            print(e)
+            if str(base).lower().endswith("k"):
+                return int(float(str(base)[:-1]) * 1000)
+        except ValueError:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Owner commands
+# ---------------------------------------------------------------------------
+@client.on(events.NewMessage(pattern=r"^/clear_db\b", func=owner_only))
+async def clear_db(event):
+    auction_pokes.delete_many({})
+    await event.reply("Done")
+
+
+@client.on(events.NewMessage(pattern=r"^/addadmin\b", func=owner_only))
+async def addadmin(event):
+    await add_user(event, admins, "admins", "Already admin.")
+
+
+@client.on(events.NewMessage(pattern=r"^/remadmin\b", func=owner_only))
+async def remadmin(event):
+    await remove_user(event, admins, "admins", "User is not admin.", "Done")
+
+
+# ---------------------------------------------------------------------------
+# Admin commands
+# ---------------------------------------------------------------------------
+@client.on(events.NewMessage(pattern=r"^/entry\s+(on|off)\b", func=admin_only))
+async def entry(event):
+    await toggle_setting(event, "entry", "Entry")
+
+
+@client.on(events.NewMessage(pattern=r"^/bid\s+(on|off)\b", func=admin_only))
+async def bid(event):
+    await toggle_setting(event, "bid", "Bid")
+
+
+@client.on(events.NewMessage(pattern=r"^/auction\s+(on|off)\b", func=admin_only))
+async def auction(event):
+    action = event.pattern_match.group(1).lower()
+    current_state = get_auction_state()
+
+    if action == "on":
+        if current_state:
+            return await event.reply("Auction is already ongoing.")
+        # A NEW auction starts -> only now the previous auction's items are removed
+        auction_pokes.delete_many({"ended": True})
+        # Auction on -> submission (entry) and bidding open automatically
+        config.update_one({"_id": 0},
+                          {"$set": {"auction": True, "entry": True, "bid": True}},
+                          upsert=True)
+        return await event.reply("Auction started.\n✅ Submission and bidding are now open.")
+
+    # action == "off"
+    if not current_state:
+        return await event.reply("Auction is already disabled.")
+    # Auction off -> submission (entry) and bidding locked automatically
+    config.update_one({"_id": 0},
+                      {"$set": {"auction": False, "entry": False, "bid": False}},
+                      upsert=True)
+    await event.reply("Auction has been disabled.\n🔒 Submission and bidding are now locked.")
+
+    # Items are NOT deleted now (/item /myitem /mybids keep working);
+    # they are only marked as ended and cleared when the next auction starts.
+    docs = list(auction_pokes.find({"ended": {"$ne": True}}))
+    ids = [d["_id"] for d in docs]
+    if ids:
+        auction_pokes.update_many({"_id": {"$in": ids}}, {"$set": {"ended": True}})
+        previous_data.insert_many([{k: v for k, v in d.items() if k != "_id"} for d in docs])
+    await event.reply("Spam started")
+
+    for doc in docs:
+        await close_bid_post(doc)          # remove the Bid button
+        if not doc.get("bidders") or not doc.get("bids"):
+            continue                       # unsold
+        try:
+            seller = await get_mention(doc['user_id'])
+            buyer = await get_mention(doc['bidders'][-1])
+            pname = clean_md(doc['pokemon_name'])
+            text = (
+                f"🔹 **Pokémon:** [{pname}]({item_link(doc)})\n"
+                f"🌿 **Nature:** {doc['nature']}\n"
+                f"📊 **Base:** `{doc['base']}`\n"
+                f"🆔 **Item ID:** `{doc['token']}`\n\n"
+                f"💰 **Buyer:** {buyer}\n"
+                f"💵 **Price:** `{doc['bids'][-1]}`"
+            )
+        except Exception:
+            print("skipping")
             continue
-        if len(text) + len(line) > MAX_LEN:
-            text += f"\n…and {len(items) - shown} more"
-            break
-        text += line
-        shown += 1
-    return text
-
-
-def _type_buttons():
-    return [
-        [Button.inline("🌟 Legendary", data="klegend")],
-        [Button.inline("🐉 Non-Legendary", data="knonlegend")],
-        [Button.inline("✨ Shiny", data="kshiny")],
-        [Button.inline("📚 TMs", data="ktms")],
-    ]
-
-
-@client.on(events.NewMessage(pattern=r"^/myitems?(@\w+)?\s*$"))
-async def myitems(event):
-    if already_handled(event, "myitem"):
-        return
-    items = list(auction_pokes.find({"user_id": event.sender_id}))
-    if not items:
-        return await event.reply("You have no items in auction.")
-    text = _build_list("**Your Items in Auction:**\n\n", items)
-    await event.reply(text, link_preview=False)
-
-
-@client.on(events.NewMessage(pattern=r"^/mybids?(@\w+)?\s*$"))
-async def mybids(event):
-    if already_handled(event, "mybids"):
-        return
-    mine = []
-    for poke in auction_pokes.find({}):
+        await asyncio.sleep(1)
         try:
-            if poke["bidders"][-1] == event.sender_id:
-                mine.append(poke)
+            await client.send_message(final_logs_id, f"👤 **Seller:** {seller}\n" + text,
+                                      link_preview=False)
         except Exception:
             pass
-    if not mine:
-        return await event.reply("You have no active bids.")
-    text = _build_list("**Your Bids on Items:**\n\n", mine)
-    await event.reply(text, link_preview=False)
+        await asyncio.sleep(1)
+        try:
+            await client.send_message(doc['user_id'], text, link_preview=False)
+        except Exception:
+            pass
+        try:
+            await client.send_message(doc['bidders'][-1], f"You won the bid for \n\n{text}",
+                                      link_preview=False)
+        except Exception:
+            pass
+
+    await event.reply("Spam done")
 
 
-@client.on(events.NewMessage(pattern=r"^/items?(@\w+)?\s*$"))
-async def show_items(event):
-    if already_handled(event, "item"):
-        return
-    for tipe, title in TYPE_ORDER:
-        items = list(auction_pokes.find({"tipe": tipe}))
-        if items:
-            return await send_items(event, items, title)
-    await event.reply("❌ No Pokémon found in auction.")
+@client.on(events.NewMessage(pattern=r"^/verify\b", func=admin_only))
+async def verify(event):
+    await add_user(event, verified, "verified", "Already verified.")
 
 
-# Callback handlers for each type
-@client.on(events.CallbackQuery(data=b"klegend"))
-async def show_legend(event):
-    await send_items(event, list(auction_pokes.find({"tipe": 0})), "🌟 Legendary")
-
-@client.on(events.CallbackQuery(data=b"knonlegend"))
-async def show_nonlegend(event):
-    await send_items(event, list(auction_pokes.find({"tipe": 1})), "🐉 Non-Legendary")
-
-@client.on(events.CallbackQuery(data=b"kshiny"))
-async def show_shiny(event):
-    await send_items(event, list(auction_pokes.find({"tipe": 2})), "✨ Shiny")
-
-@client.on(events.CallbackQuery(data=b"ktms"))
-async def show_tms(event):
-    await send_items(event, list(auction_pokes.find({"tipe": 3})), "📚 TMs")
+@client.on(events.NewMessage(pattern=r"^/unverify\b", func=admin_only))
+async def unverify(event):
+    await remove_user(event, verified, "verified", "User is not verified.", "❌ User has been unverified.")
 
 
-# Shared response sender
-# - from /item (a normal message)  -> reply ONCE
-# - from a category button         -> edit the same message
-async def send_items(event, items, title):
-    is_callback = isinstance(event, events.CallbackQuery.Event)
+@client.on(events.NewMessage(pattern=r"^/bban\b", func=admin_only))
+async def bid_ban(event):
+    await add_user(event, bid_banned, "bid_banned", "Already banned from bidding.")
 
-    if items:
-        text = _build_list(f"**{title} Pokémon in Auction:**\n\n", items)
-    else:
-        text = f"❌ No {title.lower()} found."
 
-    if not is_callback:
-        return await event.reply(text, buttons=_type_buttons(), link_preview=False)
+@client.on(events.NewMessage(pattern=r"^/b_unban\b", func=admin_only))
+async def bid_unban(event):
+    await remove_user(event, bid_banned, "bid_banned", "User is not banned from bidding.",
+                      "✅ User has been unbanned.")
 
+
+@client.on(events.NewMessage(pattern=r"^/sban\b", func=admin_only))
+async def sub_ban(event):
+    await add_user(event, sub_banned, "sub_banned", "Already banned from submission.")
+
+
+@client.on(events.NewMessage(pattern=r"^/s_unban\b", func=admin_only))
+async def sub_unban(event):
+    await remove_user(event, sub_banned, "sub_banned", "User is not banned.", "✅ User has been unbanned.")
+
+
+@client.on(events.NewMessage(pattern=r"^/remitem\b", func=admin_only))
+async def remitem(event):
+    mess_sp = event.raw_text.split(" ", 2)
+    if len(mess_sp) < 2:
+        return await event.reply("Please put item id for which it is to be removed.")
+    item_id = mess_sp[1]
+    mm = auction_pokes.find_one_and_delete({"token": item_id})
+    if mm is None:
+        return await event.reply("Auction item not found.")
+    ids = [x for x in (mm.get("bmid"), mm.get("msg_id")) if x]
+    if not mm.get("msg_id"):
+        try:
+            ids.append(int(mm["link"].split("/")[-1]))
+        except Exception:
+            pass
     try:
-        await event.edit(text, buttons=_type_buttons(), link_preview=False)
-    except telethon.errors.rpcerrorlist.MessageNotModifiedError:
-        pass
-    except Exception as e:
-        print("send_items edit failed:", e)
-        await event.respond(text, buttons=_type_buttons(), link_preview=False)
-    try:
-        await event.answer()
+        if ids:
+            await client.delete_messages(auction_channel_id, ids)
     except Exception:
         pass
+    try:
+        if len(mess_sp) != 3:
+            await client.send_message(mm["user_id"], f"Admins Removed {mm['nature']} {mm['pokemon_name']}")
+        else:
+            await client.send_message(mm["user_id"],
+                                      f"Admins Removed {mm['nature']} {mm['pokemon_name']} cause {mess_sp[2]}")
+    except Exception:
+        pass
+    await event.reply("Done")
+
+
+@client.on(events.NewMessage(pattern=r"^/resetbid\b", func=admin_only))
+async def resetbid(event):
+    mess_sp = event.raw_text.split(" ")
+    if len(mess_sp) != 2:
+        return await event.reply("Please put item id for which it is to be reset.")
+    item_id = mess_sp[1]
+    mm = auction_pokes.find_one_and_update({"token": item_id}, {"$set": {"bids": [], "bidders": []}})
+    if mm is None:
+        return await event.reply("Auction item not found.")
+    try:
+        await update_bid_post(mm, mm['base'], None)
+    except Exception as e:
+        return await event.reply(f"❌ Failed to update the post: {e}")
+    await event.reply("Done")
+
+
+@client.on(events.NewMessage(pattern=r"^/setbid\b", func=admin_only))
+async def setbid(event):
+    mess_sp = event.raw_text.split(" ", 3)
+    if len(mess_sp) != 4:
+        return await event.reply("Invalid use like /setbid item_id user_id bid")
+
+    item_id, user_str, amount_str = mess_sp[1], mess_sp[2], mess_sp[3].strip()
+    if not user_str.isdigit():
+        return await event.reply("User id must be a number.")
+    user_id = int(user_str)
+
+    target = user_db.find_one({"_id": user_id})
+    if target is None:
+        return await event.reply("Dunno that user..")
+
+    if auction_pokes.find_one({"token": item_id}) is None:
+        return await event.reply("Auction item not found.")
+
+    amount = validate_base(amount_str)
+    if not amount:
+        return await event.reply("Incorrect bid amount.")
+
+    mm = auction_pokes.find_one_and_update({"token": item_id},
+                                           {"$push": {"bids": amount, "bidders": user_id}})
+    try:
+        await update_bid_post(mm, amount, user_id, await get_first_name(user_id))
+    except Exception as e:
+        return await event.reply(f"❌ Failed to update the post: {e}")
+    await event.reply("Done")
+
+
+@client.on(events.NewMessage(pattern=r"^/rollback\b", func=admin_only))
+async def rollback(event):
+    mess_sp = event.raw_text.split(" ")
+    if len(mess_sp) < 2:
+        return await event.reply("Please provide the item id.")
+
+    item_id = mess_sp[1]
+    num = 1  # default rollback count
+
+    if len(mess_sp) >= 3:
+        if not mess_sp[2].isdigit():
+            return await event.reply("Number of bids to rollback must be an integer.")
+        num = int(mess_sp[2])
+        if num <= 0:
+            return await event.reply("Rollback number must be positive.")
+
+    doc = auction_pokes.find_one({"token": item_id})
+    if not doc:
+        return await event.reply("Item ID not found.")
+
+    bids = doc.get("bids", [])
+    bidders = doc.get("bidders", [])
+
+    if len(bids) < num or len(bidders) < num:
+        return await event.reply(f"Cannot rollback {num} bids; only {len(bids)} bids exist.")
+
+    new_bids = bids[:-num]
+    new_bidders = bidders[:-num]
+
+    auction_pokes.find_one_and_update(
+        {"token": item_id},
+        {"$set": {"bids": new_bids, "bidders": new_bidders}}
+    )
+
+    try:
+        if len(new_bids) == 0:
+            await update_bid_post(doc, doc['base'], None)
+        else:
+            await update_bid_post(doc, validate_base(new_bids[-1]), new_bidders[-1],
+                                  await get_first_name(new_bidders[-1]))
+    except Exception as e:
+        return await event.reply(f"❌ Failed to update the post: {e}")
+
+    if len(new_bids) == 0:
+        await event.reply(f"Rolled back {num} bids. No bids left now.")
+    else:
+        mention = await get_mention(new_bidders[-1])
+        await event.reply(f"Rolled back {num} bids.\n"
+                          f"Current last bid: {new_bids[-1]}\n"
+                          f"Current last bidder: {mention}")
+
+
+@client.on(events.NewMessage(pattern=r"^/msg\b", func=admin_only))
+async def snipe(event):
+    mess_sp = event.raw_text.split(" ", 2)
+    if len(mess_sp) != 3 or not mess_sp[1].isdigit():
+        return await event.reply("Invalid use like /msg user_id msg")
+    try:
+        await client.send_message(int(mess_sp[1]), mess_sp[2])
+    except Exception as e:
+        return await event.reply(f"❌ Failed: {e}")
+    await event.reply("Done")
+
+
+@client.on(events.NewMessage(pattern=r"^/broadcast\b", func=admin_only))
+async def bcast(event):
+    replied_msg = None
+    msg = None
+    if event.is_reply:
+        replied_msg = await event.get_reply_message()
+    else:
+        parts = event.raw_text.split(" ", 1)
+        if len(parts) < 2:
+            return await event.reply("Reply to a message or use /broadcast your message")
+        msg = parts[1]
+
+    await event.reply("Starting broadcast...")
+    user_ids = [doc["_id"] for doc in user_db.find({}, {"_id": 1})]
+    success = 0
+    failed = 0
+
+    for uid in user_ids:
+        try:
+            if replied_msg:
+                await replied_msg.forward_to(uid)
+            else:
+                await client.send_message(uid, msg)
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.1)  # avoid flood limits
+
+    await event.reply(f"Broadcast completed.\n✅ Sent: {success}\n❌ Failed: {failed}")
+
+
+# ---------------------------------------------------------------------------
+# Public command
+# ---------------------------------------------------------------------------
+PROFILE_ROWS = (("Legendary", 0), ("Non-Legendary", 1), ("Shiny", 2), ("TMs", 3))
+
+
+def _profile_section(title, counts):
+    """Bold title + total, then a quote with only the types that are not 0."""
+    total = sum(counts)
+    rows = [f"{label} — {counts[idx]}" for label, idx in PROFILE_ROWS if counts[idx]]
+    body = "\n".join(rows) if rows else "Nothing yet"
+    return f"<b>{title}</b> · {total}\n<blockquote>{body}</blockquote>"
+
+
+@client.on(events.NewMessage(pattern=r"^/profile\b"))
+async def profile(event):
+    parts = event.raw_text.split()
+    if event.is_reply or len(parts) >= 2:
+        uid, err = await get_target(event)
+        if err:
+            return await event.reply(err)
+    else:
+        uid = event.sender_id
+
+    # Always show the user's name as a deep link, never the raw ID
+    name = html_lib.escape(str(await get_first_name(uid)))
+    username = f'<a href="tg://user?id={int(uid)}">{name}</a>'
+
+    if uid in admins or uid in OWNERS:
+        post = "👑 Admin"
+    elif uid in verified:
+        post = "✅ Verified"
+    else:
+        post = "❌ Not verified"
+
+    # Currently listed in the live auction
+    listed = [0, 0, 0, 0]
+    for d in auction_pokes.find({"user_id": uid, "ended": {"$ne": True}}, {"tipe": 1}):
+        t = d.get("tipe")
+        if t in (0, 1, 2, 3):
+            listed[t] += 1
+
+    # Bought = won in past auctions (the user was the last/highest bidder)
+    bought = [0, 0, 0, 0]
+    for d in previous_data.find({"bidders": uid}, {"tipe": 1, "bidders": 1}):
+        bidders = d.get("bidders") or []
+        t = d.get("tipe")
+        if bidders and bidders[-1] == uid and t in (0, 1, 2, 3):
+            bought[t] += 1
+
+    text = (f"{username} {post}\n\n"
+            f"{_profile_section('Bought', bought)}\n\n"
+            f"{_profile_section('Listed', listed)}")
+    await event.reply(text, parse_mode="html", link_preview=False)
