@@ -1,8 +1,0 @@
-telethon
-pymongo
-dnspython
-imagekitio<5
-requests
-pillow
-cryptg
-aiohttp
